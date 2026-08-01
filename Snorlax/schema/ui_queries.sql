@@ -166,7 +166,9 @@ WITH
   coalesce(parseDateTimeBestEffortOrNull({from:String},'UTC'), (SELECT min(minute) FROM sonyliv_concurrency.concurrency_now)) AS from_ts,
   coalesce(parseDateTimeBestEffortOrNull({to:String},'UTC'),   (SELECT max(minute) FROM sonyliv_concurrency.concurrency_now)) AS to_ts
 SELECT content_id,
-       dictGetOrDefault('sonyliv_concurrency.content_dict','title', content_id, concat('Unknown (', toString(content_id), ')')) AS title,
+       -- content_dict is COMPLEX_KEY_HASHED (negative content_ids, review #1):
+       -- key must be wrapped, dictGetOrDefault(..., tuple(content_id), default).
+       dictGetOrDefault('sonyliv_concurrency.content_dict','title', tuple(content_id), concat('Unknown (', toString(content_id), ')')) AS title,
        max(c) AS peak, argMax(minute, c) AS peak_minute
 FROM (
   SELECT content_id, minute, sum(concurrent) AS c

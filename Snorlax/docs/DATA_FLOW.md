@@ -1,7 +1,7 @@
 # Snorlax data flow
 
 Traced directly from the executable pipeline (`producer/produce_events.py`,
-`schema/*.sql`, `migrations/run_sql.py`) — not from the design docs.
+`schema/*.sql`, `schema/migrations/run_sql.py`) — not from the design docs.
 
 ## 1. End-to-end (live path)
 
@@ -19,8 +19,8 @@ flowchart TD
     MVDV["mv_dim_values<br/>(incremental)"]
     DV["dim_values<br/>(UI filter dropdowns)"]
 
-    MVSI["mv_session_intervals<br/>REFRESH EVERY 30 SECOND<br/>scoped to sessions seen in last 20 min<br/>— state machine, see §2 —"]
-    SI["session_intervals<br/>ReplacingMergeTree(version), one row/session<br/>Array(Tuple(active_start, active_end))"]
+    MVSI["mv_session_intervals<br/>REFRESH EVERY 30 SECOND APPEND<br/>scoped to sessions seen in last 20 min<br/>— state machine, see §2 —"]
+    SI["session_intervals<br/>ReplacingMergeTree(version), one row/session<br/>Array(Tuple(active_start, active_end, platform, user_id))"]
 
     HOTMV["concurrency_hot_abs_mv<br/>REFRESH EVERY 30 SECOND<br/>DEPENDS ON mv_session_intervals<br/>expand → minute buckets, last 10 min,<br/>uniqExact per (dims, minute)"]
     HOT["concurrency_hot_abs<br/>MergeTree, wholesale REPLACE each cycle"]
@@ -47,6 +47,14 @@ Cold and hot are kept disjoint by minute (`concurrency_now`'s `WHERE`
 clause), so nothing is ever double-counted across the tiers, and cold minutes
 are never recomputed once written (append-only forward fill).
 
+`mv_session_intervals` and `mv_cold_compaction` are both refreshable MVs and
+both require `APPEND` on their `REFRESH ... TO <table>` clause: without it,
+a refreshable MV fully *replaces* its target table's contents on every
+cycle instead of accumulating. `mv_session_intervals`'s query is scoped to a
+20-minute recency window, so missing `APPEND` there silently wiped every
+session outside that window — including the full one-shot historical
+backfill and the seeded CSV batch — on every 30s cycle.
+
 ## 2. The state machine (how "truly active" is derived)
 
 This exact CTE chain appears three times, verbatim, because three different
@@ -61,8 +69,8 @@ flowchart TD
     CO["collapsed<br/>group by (session, ts-ms); deactivate wins ties"]
     ST["stated<br/>argMax(transition) OVER (PARTITION BY sid ORDER BY ts)<br/>= running foreground/background state<br/>+ row_number, count, leadInFrame(next ts)"]
     SG["segments<br/>WHERE state_sign = 1<br/>seg_end = next_ts if gap ≤ cfg_gap_timeout_seconds()<br/>else ts + cfg_heartbeat_seconds() (grace tail)"]
-    IS["islands / per_island<br/>merge consecutive/overlapping segments<br/>into [min(seg_start), max(seg_end))<br/>HAVING iend &gt; istart"]
-    ROW["one row per session<br/>intervals = arraySort(groupArray((istart, iend)))"]
+    IS["islands / per_island<br/>merge consecutive/overlapping segments<br/>into [min(seg_start), max(seg_end))<br/>new island also on platform OR user_id change<br/>HAVING iend &gt; istart"]
+    ROW["one row per session<br/>intervals = arraySort(groupArray((istart, iend, platform, user_id)))"]
     SI["session_intervals<br/>ReplacingMergeTree(version) ORDER BY video_session_id"]
 
     RAW --> PE --> CO --> ST --> SG --> IS --> ROW --> SI
@@ -107,20 +115,29 @@ flowchart TD
 
 5. **`islands`** / **`per_island`** — merge consecutive/overlapping segments
    for the same session into single `[min(seg_start), max(seg_end))`
-   intervals (`new_island` flags a gap; `sum(new_island) OVER (...)` assigns
-   an island id). `HAVING iend > istart` drops zero-length islands.
+   intervals (`new_island` flags a gap **or** a platform/user_id change vs.
+   the previous segment via `lagInFrame(...)`; `sum(new_island) OVER (...)`
+   assigns an island id). Forcing a boundary on platform/user_id change means
+   `any(platform)`/`any(user_id)` per island is never a lossy collapse across
+   genuinely different values — ~95 sessions (0.9%) span >1 platform and
+   ~120 span >1 user_id (e.g. a device switch mid-session). `HAVING iend >
+   istart` drops zero-length islands.
 
 6. Collapse per session into **one row** — `arraySort(iv -> iv.1,
-   groupArray((istart, iend)))` — which is what makes `session_intervals`
-   safe under `ReplacingMergeTree(version) ORDER BY video_session_id`: a
-   refresh producing fewer islands than before still fully replaces the row,
-   so no stale interval can survive `FINAL`.
+   groupArray((istart, iend, platform, user_id)))` — which is what makes
+   `session_intervals` safe under `ReplacingMergeTree(version) ORDER BY
+   video_session_id`: a refresh producing fewer islands than before still
+   fully replaces the row, so no stale interval can survive `FINAL`. Note
+   platform/user_id ride *inside* the tuple, not as separate session-level
+   columns — each interval carries its own, exact by construction from step 5.
 
 ## 3. Minute expansion (interval → serving row)
 
 Every consumer of `session_intervals` (hot MV, cold MV, `03_backfill.sql`,
-`04_approaches.sql`) expands `[active_start, active_end)` into buckets the
-same way:
+`04_approaches.sql`) unpacks the tuple as `iv.1 AS active_start, iv.2 AS
+active_end, iv.3 AS platform, iv.4 AS user_id` (platform/user_id are no
+longer plain columns on `session_intervals` itself) and expands
+`[active_start, active_end)` into buckets the same way:
 
 ```sql
 toStartOfInterval(active_start, toIntervalSecond(cfg_bucket_seconds()))
@@ -217,10 +234,14 @@ machine above has to get right: pauses, backgrounding, ad breaks,
 seek/buffer stalls, playback errors that recover, silently abandoned
 sessions (no `VideoSessionEnd` — a heartbeat-gap case), late-arriving/
 out-of-order heartbeats (`LATE_ARRIVAL_PROB`), and long-lived "marathon"
-sessions that never end (`MARATHON_FRACTION`). Each simulated `Session`
-walks the lifecycle below, emitting rows with the same `(event_type, event)`
-vocabulary the state machine's `multiIf` classifies (e.g.
-`("VideoPause", "pause")`, `("AppForegrounded", "resume")`):
+sessions that never end (`MARATHON_FRACTION`). Before entering the main
+event loop, `main()` calls `_seed_content_dim()`, which idempotently
+inserts the `CONTENT_CATALOG` rows into `content_dim` (a ReplacingMergeTree,
+so re-inserting is safe) and reloads the dictionary, ensuring the content
+reference data is available regardless of the seed/backfill sequence.
+Each simulated `Session` walks the lifecycle below, emitting rows with
+the same `(event_type, event)` vocabulary the state machine's `multiIf`
+classifies (e.g. `("VideoPause", "pause")`, `("AppForegrounded", "resume")`):
 
 ```mermaid
 stateDiagram-v2
@@ -267,10 +288,10 @@ throughput guidance baked into `01_schema.sql`'s header comment.
 ## 6. Running it
 
 ```bash
-cd Snorlax/migrations
+cd Snorlax/schema/migrations
 python run_sql.py --reset --build   # drop everything, recreate structure only
 python run_sql.py --all             # full offline pipeline, 00 → 06
-python run_sql.py --migrate         # apply migrations/NNN_*.sql in order
+python run_sql.py --migrate         # apply schema/migrations/NNN_*.sql in order
 python run_sql.py -i                # interactive REPL
 ```
 `run_sql.py` loads connection details from `producer/.env` and keeps one

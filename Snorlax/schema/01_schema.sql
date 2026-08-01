@@ -107,15 +107,21 @@ ENGINE = ReplacingMergeTree ORDER BY content_id;
 -- means the whole prior row is superseded, so stale islands can never survive
 -- under FINAL (unlike a per-interval key, where a shrunk island count leaves
 -- orphaned high-index rows behind).
+-- `platform` and `user_id` ride INSIDE each interval tuple, not as
+-- session-level columns: ~95/42,990 sessions (0.9%) genuinely span >1
+-- platform (device switch mid-session) and ~120/42,990 span >1 user_id, and
+-- an island boundary is now also forced on either changing (see
+-- mv_session_intervals below), so each interval's platform/user_id is
+-- unambiguous. country/content_id stay session-level scalars — measured at
+-- 0 and 1 sessions spanning >1 value respectively, genuinely negligible.
+-- title rides as a plain column: 1:1 with content_id, so no cardinality cost.
 CREATE TABLE IF NOT EXISTS sonyliv_concurrency.session_intervals
 (
-    -- One row per session (array of intervals). user_id + title are 1:1 with the
-    -- session/content so they ride as plain columns: user_id enables user-level
-    -- concurrency, title makes the content name a keyed dim without cardinality cost.
-    video_session_id String, user_id String,
-    intervals Array(Tuple(active_start DateTime64(3,'UTC'), active_end DateTime64(3,'UTC'))),
+    -- One row per session (array of intervals).
+    video_session_id String,
+    intervals Array(Tuple(active_start DateTime64(3,'UTC'), active_end DateTime64(3,'UTC'), platform LowCardinality(String), user_id String)),
     is_provisional UInt8 DEFAULT 0,
-    content_id Int64, platform LowCardinality(String), country LowCardinality(String),
+    content_id Int64, country LowCardinality(String),
     video_type LowCardinality(String), category LowCardinality(String),
     title String, version UInt64
 )
@@ -206,12 +212,17 @@ ENGINE = ReplacingMergeTree ORDER BY (dim, value);
 -- =====================================================================
 -- B. DICTIONARY (content enrichment via dictGet)
 -- =====================================================================
+-- COMPLEX_KEY_HASHED, not plain HASHED: content_id is Int64 and can be
+-- negative (the placeholder-ID sentinel, review #1); plain HASHED's simple-key
+-- layout silently requires UInt64 and throws on a negative key (also breaks
+-- dictGetOrDefault). Callers must wrap the key: dictGet(..., tuple(content_id)).
 DROP DICTIONARY IF EXISTS sonyliv_concurrency.content_dict;
 CREATE DICTIONARY sonyliv_concurrency.content_dict
 ( content_id Int64, title String, video_type String, category String )
 PRIMARY KEY content_id
 SOURCE(CLICKHOUSE( USER 'default' PASSWORD '' DB 'sonyliv_concurrency' TABLE 'content_dim' ))
-LAYOUT(HASHED()) LIFETIME(MIN 600 MAX 1200);
+LAYOUT(COMPLEX_KEY_HASHED())
+LIFETIME(MIN 600 MAX 1200);
 
 -- =====================================================================
 -- C. SERVING VIEW (what UI reads) — cold ∪ hot, disjoint by minute
@@ -271,21 +282,26 @@ SELECT 'country' AS dim, country AS value FROM sonyliv_concurrency.events_raw;
 -- dictGet — a ClickHouse Cloud dictionary reload is node-local, so a stale
 -- replica can silently serve wrong video_type/category (LEFT so sessions with
 -- an unrecognized content_id still count, just with empty dims).
+-- APPEND is required: without it a refreshable MV fully REPLACES the target
+-- table's contents on every cycle (see mv_cold_compaction below for the same
+-- footgun) — this view's query is scoped to a 20-min recency window, so a
+-- plain (non-APPEND) refresh would wipe every session outside that window on
+-- every single cycle, destroying 03_backfill.sql's full-history backfill and
+-- any session from the historical seed batch within ~30s of table creation.
 DROP VIEW IF EXISTS sonyliv_concurrency.mv_session_intervals;
 CREATE MATERIALIZED VIEW sonyliv_concurrency.mv_session_intervals
-REFRESH EVERY 30 SECOND TO sonyliv_concurrency.session_intervals EMPTY AS
+REFRESH EVERY 30 SECOND APPEND TO sonyliv_concurrency.session_intervals EMPTY AS
 -- Column order MUST match session_intervals (positional MV insert):
--- video_session_id, user_id, intervals, is_provisional, content_id, platform,
+-- video_session_id, intervals, is_provisional, content_id,
 -- country, video_type, category, title, version. Content dims (incl. title) come
 -- from a LEFT JOIN content_dim, NOT dictGet — a Cloud dictionary reload is
 -- node-local, so a stale replica could otherwise serve wrong dims.
 SELECT sess.video_session_id AS video_session_id,
-       sess.user_id AS user_id,
        sess.intervals AS intervals,
        -- provisional threshold tied to the same gap timeout (00_config.sql) used to
        -- close a stretch, so tuning that one knob keeps this consistent too.
        toUInt8(sess.last_active_end >= now() - toIntervalSecond(cfg_gap_timeout_seconds())) AS is_provisional,
-       sess.content_id AS content_id, sess.platform AS platform, sess.country AS country,
+       sess.content_id AS content_id, sess.country AS country,
        cd.video_type AS video_type, cd.category AS category, cd.title AS title,
        toUnixTimestamp64Milli(now64(3)) AS version
 FROM
@@ -329,8 +345,17 @@ FROM
               addSeconds(ts, cfg_heartbeat_seconds())) AS seg_end
     FROM stated WHERE state_sign = 1 ),
   islands AS (
+    -- A new island starts on a time gap (as before), a platform change, OR a
+    -- user_id change — forces every island to have exactly one platform and
+    -- one user_id by construction, so per_island's any(...) below is never a
+    -- lossy collapse across genuinely different values
+    -- (GAP #platform-per-session, GAP #user_id-per-session).
     SELECT *, if(seg_start > max(seg_end) OVER (PARTITION BY sid ORDER BY seg_start
-               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 1, 0) AS new_island
+               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+               OR platform != lagInFrame(platform) OVER (PARTITION BY sid ORDER BY seg_start
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+               OR user_id != lagInFrame(user_id) OVER (PARTITION BY sid ORDER BY seg_start
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 1, 0) AS new_island
     FROM segments ),
   per_island AS (
     SELECT sid, island_id, min(seg_start) AS istart, max(seg_end) AS iend,
@@ -342,11 +367,13 @@ FROM
   -- Collapse a session's islands into one array-typed row — see the
   -- session_intervals table comment: this is what makes a shrunk island
   -- count (fewer islands than the previous refresh) unable to leave stale
-  -- rows behind under FINAL.
-  SELECT sid AS video_session_id, any(user_id) AS user_id,
-         arraySort(iv -> iv.1, groupArray((istart, iend))) AS intervals,
+  -- rows behind under FINAL. platform/user_id now ride INSIDE each interval
+  -- tuple (per_island's values, unambiguous by construction above) instead
+  -- of being collapsed again to one value across the whole session.
+  SELECT sid AS video_session_id,
+         arraySort(iv -> iv.1, groupArray((istart, iend, platform, user_id))) AS intervals,
          max(iend) AS last_active_end,
-         any(content_id) AS content_id, any(platform) AS platform, any(country) AS country
+         any(content_id) AS content_id, any(country) AS country
   FROM per_island
   GROUP BY sid
 ) AS sess
@@ -373,9 +400,11 @@ FROM (
   (
     -- unpack session_intervals' one-row-per-session Array(Tuple(...)) first
     -- (ghost-interval fix, review #7) — session_intervals FINAL no longer has
-    -- active_start/active_end as plain columns.
-    SELECT video_session_id, user_id, country, platform, video_type, category, content_id,
-           iv.1 AS active_start, iv.2 AS active_end
+    -- active_start/active_end/platform/user_id as plain columns; they now
+    -- ride inside the tuple (per-interval, GAP #platform-per-session, GAP
+    -- #user_id-per-session).
+    SELECT video_session_id, country, video_type, category, content_id,
+           iv.1 AS active_start, iv.2 AS active_end, iv.3 AS platform, iv.4 AS user_id
     FROM sonyliv_concurrency.session_intervals FINAL
     ARRAY JOIN intervals AS iv
     WHERE iv.2 > iv.1
@@ -403,6 +432,12 @@ GROUP BY country, platform, video_type, category, minute, content_id;
 DROP VIEW IF EXISTS sonyliv_concurrency.mv_cold_compaction;
 CREATE MATERIALIZED VIEW sonyliv_concurrency.mv_cold_compaction
 REFRESH EVERY 1 MINUTE DEPENDS ON sonyliv_concurrency.concurrency_hot_abs_mv
+-- APPEND is required: without it a refreshable MV fully REPLACES the target
+-- table's contents on every cycle. This view's query is an incremental
+-- forward-fill (WHERE minute > max(minute) already in cold_abs), so a plain
+-- (non-APPEND) refresh would wipe cold_abs down to just that cycle's tiny
+-- new batch every minute instead of accumulating durable history.
+APPEND
 TO sonyliv_concurrency.concurrency_cold_abs EMPTY AS
 -- Bucket-aware to match D3 (00_config.sql cfg_bucket_seconds()) — hot and cold
 -- must bucket identically or concurrency_now's cold/hot union misaligns.
@@ -414,8 +449,9 @@ FROM (
          toStartOfInterval(active_start, toIntervalSecond(cfg_bucket_seconds()))
            + toIntervalSecond(number * cfg_bucket_seconds()) AS minute
   FROM (
-    SELECT video_session_id, user_id, country, platform, video_type, category, content_id,
-           iv.1 AS active_start, iv.2 AS active_end
+    -- platform/user_id now ride inside the tuple (per-interval).
+    SELECT video_session_id, country, video_type, category, content_id,
+           iv.1 AS active_start, iv.2 AS active_end, iv.3 AS platform, iv.4 AS user_id
     FROM sonyliv_concurrency.session_intervals FINAL
     ARRAY JOIN intervals AS iv
     WHERE iv.2 > iv.1

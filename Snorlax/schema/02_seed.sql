@@ -26,30 +26,26 @@
 -- =====================================================================
 
 -- A1) CONTENT MAPPING (+ dictionary reload) ------------------------------------
--- Content the synthetic sessions below reference (100-102). The 1001-3004 rows
--- match the LIVE producer's content_ids so dictGet('title',...) resolves for a
--- live deployment too; harmless extra rows for the offline smoke test.
+-- Content the synthetic sessions below reference (100-102) — that's all this
+-- file needs. The LIVE producer's own content_ids (1001-3004) used to be
+-- duplicated here too; that mapping now lives as CONTENT_CATALOG in
+-- Snorlax/producer/produce_events.py, which self-seeds content_dim on every
+-- startup (idempotent insert into the ReplacingMergeTree + dictionary reload),
+-- so it no longer depends on which seed/backfill sequence ran on the DB.
 INSERT INTO sonyliv_concurrency.content_dim (content_id, title, video_type, category) VALUES
   (100,  'Live Match A', 'live', 'sports'),
   (101,  'Movie B',      'vod',  'drama'),
-  (102,  'Show C',       'vod',  'comedy'),
-  (1001, 'Live Match 1', 'live', 'sports'),
-  (1002, 'Live Match 2', 'live', 'sports'),
-  (1003, 'Live Match 3', 'live', 'sports'),
-  (2001, 'Movie A',      'vod',  'drama'),
-  (2002, 'Movie B',      'vod',  'drama'),
-  (3001, 'Show A',       'vod',  'comedy'),
-  (3002, 'Show B',       'vod',  'comedy'),
-  (3003, 'Show C',       'vod',  'comedy'),
-  (3004, 'Show D',       'vod',  'comedy');
+  (102,  'Show C',       'vod',  'comedy');
 
 SYSTEM RELOAD DICTIONARY sonyliv_concurrency.content_dict;
 
 -- verify the mapping/dictionary resolves
+-- content_dict is COMPLEX_KEY_HASHED (negative content_ids, review #1), so the
+-- key must be wrapped: dictGet(..., tuple(content_id)).
 SELECT 100 AS content_id,
-       dictGet('sonyliv_concurrency.content_dict','title',      toInt64(100)) AS title,
-       dictGet('sonyliv_concurrency.content_dict','video_type', toInt64(100)) AS video_type,
-       dictGet('sonyliv_concurrency.content_dict','category',   toInt64(100)) AS category;
+       dictGet('sonyliv_concurrency.content_dict','title',      tuple(toInt64(100))) AS title,
+       dictGet('sonyliv_concurrency.content_dict','video_type', tuple(toInt64(100))) AS video_type,
+       dictGet('sonyliv_concurrency.content_dict','category',   tuple(toInt64(100))) AS category;
 
 -- A2) SAMPLE EVENTS (last ~8 min, so the live MVs pick them up) -----------------
 -- Session A: content 100, plays throughout, still open (no end)

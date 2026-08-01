@@ -116,7 +116,22 @@ COLUMNS = [
 # ---------------------------------------------------------------------------
 # Dummy-data dimensions
 # ---------------------------------------------------------------------------
-CONTENT_IDS = [1001, 1002, 1003, 2001, 2002, 3001, 3002, 3003, 3004]
+# Single source of truth for the producer's content catalog: title/video_type/
+# category, keyed by content_id. This used to be duplicated in schema/02_seed.sql;
+# it now lives here so the producer self-seeds content_dim (see _seed_content_dim)
+# regardless of which seed/backfill sequence ran on the DB.
+CONTENT_CATALOG = {
+    1001: ("Live Match 1", "live", "sports"),
+    1002: ("Live Match 2", "live", "sports"),
+    1003: ("Live Match 3", "live", "sports"),
+    2001: ("Movie A",      "vod",  "drama"),
+    2002: ("Movie B",      "vod",  "drama"),
+    3001: ("Show A",       "vod",  "comedy"),
+    3002: ("Show B",       "vod",  "comedy"),
+    3003: ("Show C",       "vod",  "comedy"),
+    3004: ("Show D",       "vod",  "comedy"),
+}
+CONTENT_IDS = list(CONTENT_CATALOG)
 PLATFORMS = ["android", "ios", "web", "tv", "firetv"]
 APP_VERSIONS = ["6.10.1", "6.11.0", "6.12.0", "7.0.0"]
 COUNTRIES = ["IN", "US", "GB", "AE", "AU", "CA", "SG"]
@@ -362,7 +377,34 @@ def _run_process(proc_id: int) -> None:
     print(f"[{tag}] flushed. Total inserted: {total:,} rows.", file=sys.stderr)
 
 
+def _seed_content_dim() -> None:
+    """Idempotently seed content_dim from CONTENT_CATALOG and reload the dictionary.
+
+    content_dim is a ReplacingMergeTree — inserting the same rows again is
+    harmless (see CLAUDE.md migration policy: safe to re-run), so this can run
+    every producer startup without needing an external seed step.
+    """
+    client = clickhouse_connect.get_client(
+        host=HOST, port=PORT, username=USER, password=PASSWORD, secure=SECURE, database=DATABASE,
+    )
+    try:
+        rows = [
+            [cid, title, video_type, category]
+            for cid, (title, video_type, category) in CONTENT_CATALOG.items()
+        ]
+        client.insert("content_dim", rows, column_names=["content_id", "title", "video_type", "category"])
+        try:
+            client.command("SYSTEM RELOAD DICTIONARY content_dict")
+        except Exception as exc:  # dictionary may not exist in every environment; seeding content_dim itself is what matters
+            print(f"warning: could not reload content_dict ({exc})", file=sys.stderr)
+    finally:
+        client.close()
+    print(f"[producer] seeded content_dim with {len(CONTENT_CATALOG)} rows from CONTENT_CATALOG", file=sys.stderr)
+
+
 def main() -> int:
+    _seed_content_dim()
+
     if PRODUCER_PROCESSES <= 1:
         _run_process(0)
         return 0
