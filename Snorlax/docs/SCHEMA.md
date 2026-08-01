@@ -72,8 +72,13 @@ ENGINE = ReplacingMergeTree ORDER BY content_id
 ```sql
 PRIMARY KEY content_id
 SOURCE(CLICKHOUSE(... TABLE 'content_dim'))
-LAYOUT(HASHED()) LIFETIME(MIN 600 MAX 1200)
+LAYOUT(COMPLEX_KEY_HASHED()) LIFETIME(MIN 600 MAX 1200)
 ```
+`COMPLEX_KEY_HASHED`, not plain `HASHED`: `content_id` is `Int64` and can be
+negative (placeholder-ID sentinel); plain `HASHED`'s simple-key layout
+silently requires `UInt64` and throws on a negative key. Callers wrap the key:
+`dictGet(..., tuple(content_id))` (see `schema/migrations/001_fix_content_dict_complex_key.sql`).
+
 Note: `mv_session_intervals` (the live path) deliberately does **not** use
 this dictionary for `video_type`/`category`/`title` — it `LEFT JOIN`s
 `content_dim FINAL` directly, because a ClickHouse Cloud dictionary reload is
@@ -89,10 +94,10 @@ array of that session's truly-active `[start, end)` islands.
 ```sql
 ENGINE = ReplacingMergeTree(version) ORDER BY video_session_id
 TTL toDateTime(version/1000) + INTERVAL 3 DAY
-( video_session_id String, user_id String,
-  intervals Array(Tuple(active_start DateTime64(3,'UTC'), active_end DateTime64(3,'UTC'))),
+( video_session_id String,
+  intervals Array(Tuple(active_start DateTime64(3,'UTC'), active_end DateTime64(3,'UTC'), platform LowCardinality(String), user_id String)),
   is_provisional UInt8 DEFAULT 0,
-  content_id Int64, platform, country, video_type, category LowCardinality(String),
+  content_id Int64, country, video_type, category LowCardinality(String),
   title String, version UInt64 )
 ```
 Keying on `video_session_id` alone (not per-interval) means a refresh that
@@ -100,7 +105,20 @@ derives *fewer* islands than last time simply replaces the whole row under
 `ReplacingMergeTree` + `FINAL` — no orphaned stale rows are possible for a
 shrunk interval count. `is_provisional` flags a session whose last active
 end is within `cfg_gap_timeout_seconds()` of `now()` (i.e. it might still be
-open).
+open). `platform` and `user_id` ride *inside* each interval tuple rather
+than as session-level columns: ~95/42,990 sessions (0.9%) genuinely span >1
+platform (a device switch mid-session) and ~120/42,990 span >1 user_id, and
+the state machine forces a new island on a platform OR user_id change (not
+just a time gap), so each interval's platform/user_id is unambiguous by
+construction. `country`/`content_id` stay session-level — measured at 0 and
+1 sessions spanning >1 value, genuinely negligible.
+
+The MV that populates this table live (`mv_session_intervals`, a
+`REFRESH ... APPEND TO session_intervals` refreshable view scoped to a
+20-minute recency window) must keep `APPEND`: without it, a refreshable MV
+fully *replaces* its target table on every cycle instead of accumulating,
+which silently wiped every session outside that 20-minute window (including
+the entire historical backfill) until fixed.
 
 **`session_last_seen`** — one row per session, incrementally maintained.
 ```sql
@@ -193,6 +211,14 @@ immediately — that's what `03_backfill.sql` / `02_seed.sql`'s
 `SYSTEM REFRESH VIEW ... SYSTEM WAIT VIEW ...` calls are for in an offline
 build.
 
+`mv_cold_compaction` carries `APPEND` (the other two REFRESH MVs don't). A
+refreshable MV without `APPEND` fully REPLACES its target table's contents
+every cycle; `concurrency_hot_abs_mv` relies on exactly that (it recomputes
+the whole rolling hot window each time), but `mv_cold_compaction`'s query is
+an incremental forward-fill (`WHERE minute > max(minute) already in
+concurrency_cold_abs`) — without `APPEND` it would wipe cold_abs down to just
+that cycle's new batch every minute instead of accumulating durable history.
+
 ## 4. File → object map
 
 | File | Kind | Creates / populates |
@@ -206,5 +232,6 @@ build.
 | `06_verify.sql` | READ (validate) | Serving-vs-brute-force, an independently-implemented oracle, pause-exclusion and session-start-seeding invariants |
 | `ui_queries.sql` | READ (ad hoc) | Dashboard queries against `concurrency_now` / `concurrency_ext_abs` |
 | `tuning_variants.sql` | READ (ad hoc) | Sensitivity checks for the `00_config.sql` knobs |
-| `migrations/001_foreground_state_fixes.sql` | migration | Re-applies the pause-deactivation + `VideoSessionStart`-seeds-active fix to an already-deployed `mv_session_intervals` |
-| `migrations/reset.sql` | reset (only via `--reset`) | Drops every object |
+| `schema/migrations/001_fix_content_dict_complex_key.sql` | migration | Converts `content_dict` to `COMPLEX_KEY_HASHED` so negative placeholder `content_id`s don't throw |
+| `schema/migrations/002_session_intervals_append_and_platform_per_interval.sql` | migration | Adds `APPEND` to `mv_session_intervals`; moves platform/user_id inside the interval tuple |
+| `schema/migrations/reset.sql` | reset (only via `--reset`) | Drops every object |

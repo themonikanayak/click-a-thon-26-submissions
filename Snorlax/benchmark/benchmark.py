@@ -26,7 +26,7 @@ until a pause / background / error / end; heartbeats extend activity within the
 gap timeout; paused and backgrounded time is EXCLUDED.
 
 Connection comes from the SAME env as the producer (Snorlax/producer/.env),
-exactly like migrations/run_sql.py:
+exactly like schema/migrations/run_sql.py:
   CLICKHOUSE_HOST      (required)
   CLICKHOUSE_PASSWORD  (required)
   CLICKHOUSE_PORT      (default 8443)
@@ -65,7 +65,7 @@ import clickhouse_connect
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Paths & env — mirror migrations/run_sql.py so credentials come from one place.
+# Paths & env — mirror schema/migrations/run_sql.py so credentials come from one place.
 # ---------------------------------------------------------------------------
 HERE = Path(__file__).resolve().parent          # .../Snorlax/benchmark
 SNORLAX = HERE.parent                            # .../Snorlax
@@ -158,16 +158,18 @@ REF_CORE = f"""
 """
 
 # Extended reference: enrich each active bucket with the session's 4 drill-down
-# dims (any() per session, exactly as 04_approaches.sql does) + title,
-# then aggregate to the extended key. Matches concurrency_ext_abs cell-for-cell.
+# dims (argMax(..., event_timestamp) per session — deterministic "latest wins",
+# exactly as 04_approaches.sql does; plain any() is non-deterministic here since
+# ~81% of sessions have >1 distinct value for these dims across their events)
+# + title, then aggregate to the extended key. Matches concurrency_ext_abs cell-for-cell.
 REF_EXT = f"""
 (
   WITH per_session_dims AS (
     SELECT video_session_id,
-           any(app_version)       AS app_version,
-           any(player_version)    AS player_version,
-           any(audio_language)    AS audio_language,
-           any(subtitle_language) AS subtitle_language
+           argMax(app_version, event_timestamp)       AS app_version,
+           argMax(player_version, event_timestamp)    AS player_version,
+           argMax(audio_language, event_timestamp)    AS audio_language,
+           argMax(subtitle_language, event_timestamp) AS subtitle_language
     FROM {DB}.events_raw
     GROUP BY video_session_id
   )
@@ -415,8 +417,17 @@ def _chk_day_grain(ctx: Ctx) -> Result:
 
 def _chk_foreground_only(ctx: Ctx) -> Result:
     """B8 — foreground-only correctness: serving must equal the foreground
-    reference (paused/backgrounded excluded) AND be strictly below the naive
-    "any heartbeat in the minute" count (which overcounts inactive time)."""
+    reference (paused/backgrounded excluded). Also reports, informationally,
+    a naive "any heartbeat in the minute" count for context — but that naive
+    count is NOT a reliable bound in either direction, so it's not asserted:
+    it overcounts minutes where a session paused after its last heartbeat in
+    that minute, but it also UNDERcounts minutes where the state machine
+    correctly holds a session active between two heartbeats spaced further
+    apart than the bucket width (e.g. a Play at :00 followed by the next
+    heartbeat at :01:30 — the session is genuinely active through :00, but
+    naive sees no heartbeat landing in that bucket and misses it). Sessions
+    with sparser heartbeat cadence make the undercount case dominate, so
+    naive can legitimately land on either side of the true count."""
     ref_total = q_one(ctx.client,
                       f"SELECT sum(concurrent) FROM {_wrap(ctx.ref_core, ctx.tp)}")
     serv_total = q_one(ctx.client,
@@ -440,11 +451,12 @@ def _chk_foreground_only(ctx: Ctx) -> Result:
     nv = int(naive_total[0]) if naive_total and naive_total[0] is not None else 0
     if r == 0 and s == 0:
         return Result("B8", "Foreground-only exclusion", "SKIP", "no data")
-    ok = (r == s) and (nv >= s)
+    ok = (r == s)
     pct = round(100.0 * (nv - s) / nv, 1) if nv else 0.0
     detail = (f"serving session-buckets={s}, reference={r} "
               f"({'match' if r == s else 'MISMATCH'}); "
-              f"naive(heartbeat-in-bucket)={nv}, overcount avoided={nv - s} ({pct}%)")
+              f"naive(heartbeat-in-bucket)={nv} (informational only, not "
+              f"asserted — see docstring), diff vs serving={nv - s} ({pct}%)")
     return Result("B8", "Foreground-only exclusion (vs naive)",
                   "PASS" if ok else "FAIL", detail)
 

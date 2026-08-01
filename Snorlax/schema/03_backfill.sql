@@ -20,15 +20,15 @@ TRUNCATE TABLE sonyliv_concurrency.concurrency_hot_abs;
 -- ---------------------------------------------------------------------
 -- STATE MACHINE -> session_intervals (all sessions)
 -- ---------------------------------------------------------------------
--- Column order MUST match session_intervals: video_session_id, user_id, intervals,
--- is_provisional, content_id, platform, country, video_type, category, title, version.
+-- Column order MUST match session_intervals: video_session_id, intervals,
+-- is_provisional, content_id, country, video_type, category, title, version.
+-- (platform/user_id ride inside each interval tuple, not as their own columns.)
 -- Content dims (incl. title) via LEFT JOIN content_dim, not dictGet (stale-replica fix).
 INSERT INTO sonyliv_concurrency.session_intervals
 SELECT sess.video_session_id AS video_session_id,
-       sess.user_id AS user_id,
        sess.intervals AS intervals,
        0 AS is_provisional,
-       sess.content_id AS content_id, sess.platform AS platform, sess.country AS country,
+       sess.content_id AS content_id, sess.country AS country,
        cd.video_type AS video_type, cd.category AS category, cd.title AS title,
        toUnixTimestamp64Milli(now64(3)) AS version
 FROM
@@ -72,8 +72,17 @@ FROM
     FROM stated WHERE state_sign = 1
   ),
   islands AS (
+    -- A new island starts on a time gap (as before), a platform change, OR a
+    -- user_id change — forces every island to have exactly one platform and
+    -- one user_id by construction, so per_island's any(...) below is never a
+    -- lossy collapse across genuinely different values
+    -- (GAP #platform-per-session, GAP #user_id-per-session).
     SELECT *, if(seg_start > max(seg_end) OVER (PARTITION BY sid ORDER BY seg_start
-               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 1, 0) AS new_island
+               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+               OR platform != lagInFrame(platform) OVER (PARTITION BY sid ORDER BY seg_start
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+               OR user_id != lagInFrame(user_id) OVER (PARTITION BY sid ORDER BY seg_start
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 1, 0) AS new_island
     FROM segments
   ),
   per_island AS (
@@ -85,9 +94,12 @@ FROM
     GROUP BY sid, island_id
     HAVING iend > istart
   )
-  SELECT sid AS video_session_id, any(user_id) AS user_id,
-         arraySort(iv -> iv.1, groupArray((istart, iend))) AS intervals,
-         any(content_id) AS content_id, any(platform) AS platform, any(country) AS country
+  -- platform/user_id now ride INSIDE each interval tuple (per_island's
+  -- values, unambiguous by construction above) instead of being collapsed
+  -- again to one value across the whole session.
+  SELECT sid AS video_session_id,
+         arraySort(iv -> iv.1, groupArray((istart, iend, platform, user_id))) AS intervals,
+         any(content_id) AS content_id, any(country) AS country
   FROM per_island
   GROUP BY sid
 ) AS sess
@@ -113,9 +125,10 @@ FROM (
            + toIntervalSecond(number * cfg_bucket_seconds()) AS minute
   FROM (
     -- unpack session_intervals' one-row-per-session Array(Tuple(...)) first
-    -- (ghost-interval fix, review #7).
-    SELECT video_session_id, user_id, country, platform, video_type, category, content_id,
-           iv.1 AS active_start, iv.2 AS active_end
+    -- (ghost-interval fix, review #7). platform/user_id ride inside the
+    -- tuple (per-interval, GAP #platform-per-session, GAP #user_id-per-session).
+    SELECT video_session_id, country, video_type, category, content_id,
+           iv.1 AS active_start, iv.2 AS active_end, iv.3 AS platform, iv.4 AS user_id
     FROM sonyliv_concurrency.session_intervals FINAL
     ARRAY JOIN intervals AS iv
     WHERE iv.2 > iv.1
@@ -139,9 +152,10 @@ FROM (
            + toIntervalSecond(number * cfg_bucket_seconds()) AS minute
   FROM (
     -- unpack session_intervals' one-row-per-session Array(Tuple(...)) first
-    -- (ghost-interval fix, review #7).
-    SELECT video_session_id, user_id, country, platform, video_type, category, content_id,
-           iv.1 AS active_start, iv.2 AS active_end
+    -- (ghost-interval fix, review #7). platform/user_id ride inside the
+    -- tuple (per-interval, GAP #platform-per-session, GAP #user_id-per-session).
+    SELECT video_session_id, country, video_type, category, content_id,
+           iv.1 AS active_start, iv.2 AS active_end, iv.3 AS platform, iv.4 AS user_id
     FROM sonyliv_concurrency.session_intervals FINAL
     ARRAY JOIN intervals AS iv
     WHERE iv.2 > iv.1

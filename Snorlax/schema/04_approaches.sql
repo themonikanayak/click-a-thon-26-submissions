@@ -62,9 +62,10 @@ FROM (
            + toIntervalSecond(number * cfg_bucket_seconds()) AS minute
   FROM (
     -- unpack session_intervals' one-row-per-session Array(Tuple(...)) first —
-    -- FINAL no longer exposes active_start/active_end as plain columns.
-    SELECT video_session_id, user_id, country, platform, video_type, category, content_id,
-           iv.1 AS active_start, iv.2 AS active_end
+    -- FINAL no longer exposes active_start/active_end/platform/user_id as
+    -- plain columns; they now ride inside the tuple (per-interval).
+    SELECT video_session_id, country, video_type, category, content_id,
+           iv.1 AS active_start, iv.2 AS active_end, iv.3 AS platform, iv.4 AS user_id
     FROM sonyliv_concurrency.session_intervals FINAL
     ARRAY JOIN intervals AS iv
     WHERE iv.2 > iv.1
@@ -170,9 +171,11 @@ FROM
   -- Same half-open-end idiom as 03_backfill.sql: subtract 1ms before
   -- flooring so a segment ending exactly on a minute boundary doesn't
   -- spuriously claim that next minute.
+  -- content_dict is COMPLEX_KEY_HASHED (negative content_ids, review #1), so the
+  -- key must be wrapped: dictGet(..., tuple(content_id)).
   SELECT sid AS video_session_id, user_id, country, platform,
-         dictGet('sonyliv_concurrency.content_dict','video_type', content_id) AS video_type,
-         dictGet('sonyliv_concurrency.content_dict','category',   content_id) AS category,
+         dictGet('sonyliv_concurrency.content_dict','video_type', tuple(content_id)) AS video_type,
+         dictGet('sonyliv_concurrency.content_dict','category',   tuple(content_id)) AS category,
          content_id,
          -- configurable bucket (00_config.sql): start-of-bucket + N buckets
          toStartOfInterval(seg_start, toIntervalSecond(cfg_bucket_seconds()))
@@ -238,14 +241,19 @@ TRUNCATE TABLE IF EXISTS sonyliv_concurrency.concurrency_ext_abs;
 INSERT INTO sonyliv_concurrency.concurrency_ext_abs
 WITH per_session_dims AS (
     -- one row per session: its extended dims (already normalized in events_raw).
-    -- any() attributes a session to a single value, exactly as the core path does
-    -- for platform — a session that switches audio/device mid-stream (rare) is
-    -- attributed to one; documented caveat, consistent with the core model.
+    -- argMax(..., event_timestamp) attributes a session to its LATEST value —
+    -- unlike platform (now tracked per-interval, see session_intervals), these
+    -- 4 dims genuinely vary within a session for the majority of sessions in
+    -- this dataset (measured: ~81% of sessions have >1 distinct audio_language
+    -- across their own events), so a plain any() pick is non-deterministic
+    -- between two independent runs of this same query (e.g. this table vs the
+    -- benchmark's independent reference) and produces spurious cell mismatches.
+    -- Deterministic "latest wins" tie-break instead.
     SELECT video_session_id,
-           any(app_version)       AS app_version,
-           any(player_version)    AS player_version,
-           any(audio_language)    AS audio_language,
-           any(subtitle_language) AS subtitle_language
+           argMax(app_version, event_timestamp)       AS app_version,
+           argMax(player_version, event_timestamp)    AS player_version,
+           argMax(audio_language, event_timestamp)    AS audio_language,
+           argMax(subtitle_language, event_timestamp) AS subtitle_language
     FROM sonyliv_concurrency.events_raw
     GROUP BY video_session_id
 )
@@ -278,9 +286,10 @@ FROM (
                  + toIntervalSecond(number * cfg_bucket_seconds()) AS minute
         FROM (
           -- unpack session_intervals' one-row-per-session Array(Tuple(...)) first —
-          -- FINAL no longer exposes active_start/active_end as plain columns.
-          SELECT video_session_id, user_id, country, platform, video_type, category, content_id, title,
-                 iv.1 AS active_start, iv.2 AS active_end
+          -- FINAL no longer exposes active_start/active_end/platform/user_id as
+          -- plain columns; they now ride inside the tuple (per-interval).
+          SELECT video_session_id, country, video_type, category, content_id, title,
+                 iv.1 AS active_start, iv.2 AS active_end, iv.3 AS platform, iv.4 AS user_id
           FROM sonyliv_concurrency.session_intervals FINAL
           ARRAY JOIN intervals AS iv
           WHERE iv.2 > iv.1

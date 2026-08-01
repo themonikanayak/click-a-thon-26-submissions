@@ -233,8 +233,8 @@ reference AS (
              + toIntervalSecond(number * cfg_bucket_seconds()) AS minute
     FROM (
       -- unpack session_intervals' one-row-per-session Array(Tuple(...)) first.
-      SELECT user_id, country, platform, video_type, category, content_id,
-             iv.1 AS active_start, iv.2 AS active_end
+      SELECT iv.4 AS user_id, country, video_type, category, content_id,
+             iv.1 AS active_start, iv.2 AS active_end, iv.3 AS platform
       FROM sonyliv_concurrency.session_intervals FINAL
       ARRAY JOIN intervals AS iv
       WHERE iv.2 > iv.1
@@ -301,11 +301,15 @@ first_ev AS (
 ivl AS (
   -- unpack the Array(Tuple(...)) so count() is the true interval count and
   -- min/max span the session (FINAL has no plain active_start/active_end).
-  SELECT video_session_id, min(iv.1) AS active_start, max(iv.2) AS active_end, count() AS intervals
+  -- alias must NOT be named `intervals` — that would collide with the table's
+  -- `intervals` array column being ARRAY JOIN'd in this same SELECT, and
+  -- ClickHouse resolves the ARRAY JOIN source against the output alias
+  -- instead of the column (TYPE_MISMATCH: count() is UInt64, not an array).
+  SELECT video_session_id, min(iv.1) AS active_start, max(iv.2) AS active_end, count() AS interval_count
   FROM sonyliv_concurrency.session_intervals FINAL
   ARRAY JOIN intervals AS iv
   GROUP BY video_session_id )
-SELECT so.video_session_id, f.session_start_ts, i.active_start, i.active_end, i.intervals
+SELECT so.video_session_id, f.session_start_ts, i.active_start, i.active_end, i.interval_count
 FROM start_only so
 INNER JOIN first_ev f USING (video_session_id)
 INNER JOIN ivl      i USING (video_session_id)

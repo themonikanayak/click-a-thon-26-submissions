@@ -4,7 +4,7 @@
 -- flow). Fully IDEMPOTENT: every statement is DROP ... IF EXISTS, so
 -- running it on an empty database is a harmless no-op.
 --
---   python migrations/run_sql.py --reset --build
+--   python schema/migrations/run_sql.py --reset --build
 --
 -- This is DESTRUCTIVE (drops data). It is NOT part of the ordered
 -- migrations applied by `--migrate`; it only runs when you pass --reset.
@@ -15,8 +15,11 @@
 
 -- A. MATERIALIZED VIEWS (depend on tables + the cfg_/norm_ functions) -----------
 DROP VIEW IF EXISTS sonyliv_concurrency.mv_incoming_to_raw;
+DROP VIEW IF EXISTS sonyliv_concurrency.mv_session_last_seen;
+DROP VIEW IF EXISTS sonyliv_concurrency.mv_dim_values;
 DROP VIEW IF EXISTS sonyliv_concurrency.mv_session_intervals;
 DROP VIEW IF EXISTS sonyliv_concurrency.concurrency_hot_abs_mv;
+DROP VIEW IF EXISTS sonyliv_concurrency.mv_cold_compaction;
 
 -- B. SERVING VIEW ---------------------------------------------------------------
 DROP VIEW IF EXISTS sonyliv_concurrency.concurrency_now;
@@ -34,6 +37,8 @@ DROP TABLE IF EXISTS sonyliv_concurrency.concurrency_hot_abs;
 DROP TABLE IF EXISTS sonyliv_concurrency.concurrency_ext_abs;
 DROP TABLE IF EXISTS sonyliv_concurrency.concurrency_sa_abs;   -- session-aware comparison table
 DROP TABLE IF EXISTS sonyliv_concurrency.concurrency_si_abs;   -- session-independent comparison table
+DROP TABLE IF EXISTS sonyliv_concurrency.session_last_seen;
+DROP TABLE IF EXISTS sonyliv_concurrency.dim_values;
 
 -- E. CONFIG UDFs (server-wide; recreated by 00_config.sql) -------------------------
 -- Dependent function first (it references the two knob functions).

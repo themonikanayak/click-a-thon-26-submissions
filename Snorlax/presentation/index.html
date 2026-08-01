@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Snorlax - Clickathon 2026</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+            background: #0d1117;
+            color: #e6edf3;
+            overflow: hidden;
+            line-height: 1.6;
+        }
+
+        .presentation {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+
+        .slide {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 60px 80px;
+            opacity: 0;
+            transition: opacity 0.6s ease-in-out;
+            overflow-y: auto;
+        }
+
+        .slide.active {
+            display: flex;
+            opacity: 1;
+        }
+
+        h1 {
+            font-size: 3.5rem;
+            color: #4ec9b0;
+            margin-bottom: 20px;
+            font-weight: 700;
+            text-align: center;
+        }
+
+        h2 {
+            font-size: 2.5rem;
+            color: #4ec9b0;
+            margin-bottom: 50px;
+            font-weight: 700;
+            text-align: center;
+        }
+
+        h3 {
+            font-size: 1.5rem;
+            color: #4ec9b0;
+            margin-bottom: 15px;
+            font-weight: 600;
+        }
+
+        .subtitle {
+            font-size: 1.8rem;
+            color: #8b949e;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+
+        .tagline {
+            font-size: 1.1rem;
+            color: #7d8590;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        ul {
+            list-style: none;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        li {
+            font-size: 1.3rem;
+            margin-bottom: 25px;
+            padding-left: 40px;
+            position: relative;
+            line-height: 1.7;
+        }
+
+        li:before {
+            content: "▪";
+            color: #4ec9b0;
+            position: absolute;
+            left: 0;
+            font-size: 1.1rem;
+        }
+
+        code {
+            background: #161b22;
+            padding: 2px 8px;
+            border-radius: 4px;
+            color: #79c0ff;
+            font-family: 'Courier New', monospace;
+            font-size: 0.95em;
+        }
+
+        .flex-container {
+            display: flex;
+            gap: 40px;
+            max-width: 1000px;
+            margin: 0 auto;
+            width: 100%;
+        }
+
+        .flex-box {
+            flex: 1;
+            background: #161b22;
+            padding: 30px;
+            border-radius: 8px;
+            border-left: 4px solid #4ec9b0;
+        }
+
+        .flex-box h3 {
+            margin-top: 0;
+        }
+
+        .flow-diagram {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            max-width: 900px;
+            margin: 0 auto;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .flow-step {
+            background: #161b22;
+            padding: 25px 30px;
+            border-radius: 8px;
+            border: 2px solid #4ec9b0;
+            color: #4ec9b0;
+            font-weight: 600;
+            font-size: 1rem;
+            flex: 1;
+            min-width: 120px;
+            text-align: center;
+        }
+
+        .flow-arrow {
+            color: #4ec9b0;
+            font-size: 2rem;
+            margin: 0 10px;
+        }
+
+        .config-table {
+            max-width: 900px;
+            margin: 0 auto;
+            font-size: 1.1rem;
+            line-height: 2;
+        }
+
+        .config-item {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 20px;
+        }
+
+        .config-key {
+            color: #79c0ff;
+            font-family: 'Courier New', monospace;
+            min-width: 300px;
+            font-weight: 600;
+        }
+
+        .config-desc {
+            color: #8b949e;
+        }
+
+        .dims-container {
+            display: flex;
+            gap: 30px;
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        .dims-box {
+            flex: 1;
+            background: #161b22;
+            padding: 30px;
+            border-radius: 8px;
+            border-left: 4px solid #4ec9b0;
+        }
+
+        .dims-box h3 {
+            margin-top: 0;
+        }
+
+        .dims-box ul {
+            margin: 0;
+            padding: 0;
+        }
+
+        .dims-box li {
+            font-size: 1.1rem;
+            margin-bottom: 15px;
+            padding-left: 30px;
+        }
+
+        .nav-buttons {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 20px;
+            z-index: 100;
+        }
+
+        .nav-btn {
+            background: #4ec9b0;
+            color: #0d1117;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            transition: background 0.3s;
+        }
+
+        .nav-btn:hover {
+            background: #5fd9c0;
+        }
+
+        .nav-btn:disabled {
+            background: #404854;
+            color: #6e7681;
+            cursor: not-allowed;
+        }
+
+        .slide-counter {
+            position: fixed;
+            bottom: 30px;
+            right: 40px;
+            font-size: 1.2rem;
+            color: #8b949e;
+            z-index: 100;
+        }
+
+        .title-slide {
+            background: linear-gradient(135deg, #0d1117 0%, #1c2128 100%);
+            text-align: center;
+            justify-content: center;
+        }
+
+        .title-slide h1 {
+            font-size: 5rem;
+            margin-bottom: 30px;
+            text-shadow: 0 2px 10px rgba(78, 201, 176, 0.2);
+        }
+
+        .closing-slide {
+            text-align: center;
+            background: linear-gradient(135deg, #0d1117 0%, #1c2128 100%);
+        }
+
+        .closing-slide h1 {
+            font-size: 4rem;
+            margin-bottom: 40px;
+        }
+
+        .closing-slide p {
+            font-size: 1.3rem;
+            color: #8b949e;
+            margin-bottom: 30px;
+        }
+
+        .closing-slide .repo {
+            font-family: 'Courier New', monospace;
+            color: #79c0ff;
+            font-size: 1rem;
+        }
+
+        .comparison-note {
+            max-width: 900px;
+            margin-top: 30px;
+            padding: 20px;
+            background: #161b22;
+            border-left: 4px solid #4ec9b0;
+            border-radius: 4px;
+            font-size: 1.1rem;
+            color: #8b949e;
+            text-align: center;
+        }
+
+        .centered-content {
+            text-align: center;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div class="presentation">
+        <!-- Slide 1: Title -->
+        <section class="slide active title-slide">
+            <h1>Snorlax</h1>
+            <p class="subtitle">Foreground-Only Concurrency for SonyLIV</p>
+            <p class="tagline">Real-time concurrent-viewer counting, built on ClickHouse</p>
+            <p class="tagline" style="margin-top: 40px; font-size: 1rem;">Clickathon 2026 Submission</p>
+        </section>
+
+        <!-- Slide 2: The Problem -->
+        <section class="slide">
+            <h2>The Problem</h2>
+            <ul>
+                <li>Compute real-time concurrent viewers for SonyLIV streaming at minute grain, sliceable by platform, country, content, video type, etc.</li>
+                <li>Must count foreground-only active sessions — exclude backgrounded app time, paused playback, and missing-heartbeat gaps</li>
+                <li>Sessions are open and evolving — heartbeats keep arriving for the same minute being counted, so no full recomputation</li>
+                <li>Serving layer must answer dashboard queries in sub-second time, not by rescanning raw sessions</li>
+            </ul>
+        </section>
+
+        <!-- Slide 3: Why It's Hard -->
+        <section class="slide">
+            <h2>Why It's Hard</h2>
+            <ul>
+                <li>Heartbeat gaps are ambiguous: is silence a network drop (stay active) or a backgrounded app (go inactive)? Needs a tunable gap-tolerance rule</li>
+                <li>Every event type changes "active" state differently: <code>VideoPlay</code> (+1), <code>AppBackgrounded</code> (-1), pause (-1), heartbeat (neutral), <code>VideoSessionEnd</code> (-1)</li>
+                <li>Scale: thousands of events/sec — exploding every session into per-minute rows, or recomputing overlaps per query, is too slow</li>
+                <li>Two levels of dimension cardinality (core vs. extended) must both be servable without slowing the fast path</li>
+            </ul>
+        </section>
+
+        <!-- Slide 4: The Dataset -->
+        <section class="slide">
+            <h2>The Dataset</h2>
+            <ul>
+                <li><strong>Raw events:</strong> <code>VideoSessionStart</code>, <code>VideoPlay</code>, <code>VideoHeartbeat</code> (~1/min), <code>AppBackgrounded</code>/<code>Foregrounded</code>, <code>VideoSessionEnd</code>, <code>VideoError</code>, <code>VideoSeek</code>, pause markers</li>
+                <li><strong>Content metadata:</strong> <code>content_id</code> → title, video_type, category</li>
+                <li><strong>Key fields:</strong> <code>video_session_id</code>, <code>user_id</code>, <code>event_type</code>, <code>event_timestamp</code>, platform, country, app/player versions, languages</li>
+                <li><strong>Scale:</strong> Designed for large-scale/petabyte-class volumes with open sessions spanning day boundaries</li>
+            </ul>
+        </section>
+
+        <!-- Slide 5: Our Solution (overview) -->
+        <section class="slide">
+            <h2>Our Solution</h2>
+            <ul>
+                <li>ClickHouse-based pipeline computing absolute concurrency per (dims, minute) — no cumulative sums, no carry-in</li>
+                <li>Hot/cold serving split unified by a single <code>concurrency_now</code> view</li>
+                <li>A deterministic state machine classifies foreground/background activity per session</li>
+                <li>Built and cross-validated <strong>TWO independent computation approaches</strong> to prove correctness</li>
+            </ul>
+        </section>
+
+        <!-- Slide 6: Two Approaches -->
+        <section class="slide">
+            <h2>Two Approaches</h2>
+            <div class="flex-container">
+                <div class="flex-box">
+                    <h3>Session-Aware</h3>
+                    <p style="font-size: 1.1rem; line-height: 1.8; color: #8b949e;">Reconstructs per-session truly-active intervals via a state machine; merges overlapping/consecutive segments into islands; expands to minutes; counts distinct sessions. Table: <code style="background: #0d1117;">concurrency_sa_abs</code></p>
+                </div>
+                <div class="flex-box">
+                    <h3>Session-Independent</h3>
+                    <p style="font-size: 1.1rem; line-height: 1.8; color: #8b949e;">Derives foreground state directly per event, no interval reconstruction/merging; expands raw segments to minutes; counts distinct sessions. Table: <code style="background: #0d1117;">concurrency_si_abs</code></p>
+                </div>
+            </div>
+            <div class="comparison-note">
+                Cross-validated in <code>05_compare.sql</code> — zero mismatches expected between SA, SI, and <code>concurrency_now</code>
+            </div>
+        </section>
+
+        <!-- Slide 7: Architecture - Hot/Cold Tiering -->
+        <section class="slide">
+            <h2>Architecture: Hot/Cold Tiering</h2>
+            <div class="flow-diagram">
+                <div class="flow-step">Ingest</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step">State Machine<br/><code style="font-size: 0.9rem;">session_intervals</code></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step" style="border-color: #79c0ff; color: #79c0ff; flex: 1.5;">HOT<br/>(last 10 min, refreshed 30s)</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step" style="color: #4ec9b0;">concurrency_now</div>
+            </div>
+            <div style="margin-top: 40px; text-align: center; color: #8b949e;">
+                <p style="font-size: 1.1rem;">↓</p>
+                <p style="font-size: 1.1rem;"><strong>COLD</strong> (finalized minutes, append-only) → Disjoint union, no double-counting</p>
+            </div>
+        </section>
+
+        <!-- Slide 8: Tunable Config Knobs -->
+        <section class="slide">
+            <h2>Tunable Config Knobs</h2>
+            <div class="config-table">
+                <div class="config-item">
+                    <div class="config-key">cfg_bucket_seconds()</div>
+                    <div class="config-desc">Time bucket width, default 60s</div>
+                </div>
+                <div class="config-item">
+                    <div class="config-key">cfg_heartbeat_seconds()</div>
+                    <div class="config-desc">Expected heartbeat interval, default 60s</div>
+                </div>
+                <div class="config-item">
+                    <div class="config-key">cfg_missing_heartbeat_buffer_seconds()</div>
+                    <div class="config-desc">Extra gap tolerance, default 30s</div>
+                </div>
+                <div class="config-item">
+                    <div class="config-key">cfg_gap_timeout_seconds()</div>
+                    <div class="config-desc">Total gap tolerance = heartbeat + buffer, default 90s</div>
+                </div>
+                <div class="config-item">
+                    <div class="config-key">cfg_hot_window_seconds()</div>
+                    <div class="config-desc">Hot/cold rollover window, default 600s (10 min)</div>
+                </div>
+            </div>
+            <p style="margin-top: 40px; text-align: center; color: #8b949e; font-size: 1.1rem;">All exposed as SQL UDFs → inline as constants for ClickHouse interval functions</p>
+        </section>
+
+        <!-- Slide 9: Dimensions: Core vs Extended -->
+        <section class="slide">
+            <h2>Dimensions: Core vs Extended</h2>
+            <div class="dims-container">
+                <div class="dims-box">
+                    <h3>Core (Fast, Live)</h3>
+                    <ul style="margin: 0; padding: 0;">
+                        <li>country</li>
+                        <li>platform</li>
+                        <li>video_type</li>
+                        <li>category</li>
+                        <li>minute</li>
+                        <li>content_id</li>
+                    </ul>
+                    <p style="margin-top: 20px; font-size: 1rem; color: #8b949e;">→ serves <code>concurrency_now</code></p>
+                </div>
+                <div class="dims-box">
+                    <h3>Extended (Drill-down)</h3>
+                    <ul style="margin: 0; padding: 0;">
+                        <li>Core key +</li>
+                        <li>app_version</li>
+                        <li>player_version</li>
+                        <li>audio_language</li>
+                        <li>subtitle_language</li>
+                    </ul>
+                    <p style="margin-top: 20px; font-size: 1rem; color: #8b949e;">→ <code>concurrency_ext_abs</code>, rolls back up to core counts exactly</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Slide 10: Measures & Verification -->
+        <section class="slide">
+            <h2>Measures & Verification</h2>
+            <ul>
+                <li>Two exact measures per cell: <code>concurrent</code> = <code>uniqExact(video_session_id)</code>, <code>concurrent_users</code> = <code>uniqExact(user_id)</code></li>
+                <li>Correctness verified via <code>05_compare.sql</code> (SA vs SI vs <code>concurrency_now</code>) and <code>06_verify.sql</code> (independent oracle checks)</li>
+                <li><code>benchmark/benchmark.py</code> runs PASS/FAIL checks against ground truth</li>
+                <li>Normalized languages and dimensions at ingest (<code>hin/HIN → hin</code>, empty → <code>unk</code>)</li>
+            </ul>
+        </section>
+
+        <!-- Slide 11: Tech Stack -->
+        <section class="slide">
+            <h2>Tech Stack</h2>
+            <ul>
+                <li><strong>ClickHouse Cloud</strong> — database engine with materialized views for live aggregation</li>
+                <li><strong>Redpanda + ClickPipes</strong> — streaming ingest of raw events</li>
+                <li><strong>Python</strong> — producer tooling, state-machine validation, benchmark/correctness checks</li>
+                <li><strong>SQL-driven pipeline</strong> — UDFs for tuning, deterministic state machine, idempotent migrations</li>
+                <li><strong>Two independent approaches</strong> — cross-validated to zero-mismatch correctness</li>
+            </ul>
+        </section>
+
+        <!-- Slide 12: Closing -->
+        <section class="slide closing-slide">
+            <h1>Thank You</h1>
+            <p>Questions?</p>
+            <p class="repo">github.com/click-a-thon-26-submissions/Snorlax</p>
+        </section>
+    </div>
+
+    <div class="nav-buttons">
+        <button class="nav-btn" id="prevBtn" onclick="previousSlide()">← Prev</button>
+        <button class="nav-btn" id="nextBtn" onclick="nextSlide()">Next →</button>
+    </div>
+
+    <div class="slide-counter">
+        <span id="slideCounter">1 / 12</span>
+    </div>
+
+    <script>
+        let currentSlide = 0;
+        const slides = document.querySelectorAll('.slide');
+        const totalSlides = slides.length;
+
+        function showSlide(n) {
+            slides.forEach(slide => slide.classList.remove('active'));
+            slides[n].classList.add('active');
+
+            document.getElementById('slideCounter').textContent = (n + 1) + ' / ' + totalSlides;
+
+            document.getElementById('prevBtn').disabled = n === 0;
+            document.getElementById('nextBtn').disabled = n === totalSlides - 1;
+        }
+
+        function nextSlide() {
+            if (currentSlide < totalSlides - 1) {
+                currentSlide++;
+                showSlide(currentSlide);
+            }
+        }
+
+        function previousSlide() {
+            if (currentSlide > 0) {
+                currentSlide--;
+                showSlide(currentSlide);
+            }
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') {
+                e.preventDefault();
+                nextSlide();
+            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                previousSlide();
+            }
+        });
+
+        // Swipe/click navigation
+        let touchStartX = 0;
+        let touchEndX = 0;
+
+        document.addEventListener('touchstart', (e) => {
+            touchStartX = e.changedTouches[0].screenX;
+        });
+
+        document.addEventListener('touchend', (e) => {
+            touchEndX = e.changedTouches[0].screenX;
+            if (touchStartX - touchEndX > 50) {
+                nextSlide();
+            } else if (touchEndX - touchStartX > 50) {
+                previousSlide();
+            }
+        });
+
+        // Click on right half to advance, left half to go back
+        document.addEventListener('click', (e) => {
+            if (e.target.closest('.nav-btn') || e.target.closest('#slideCounter')) {
+                return;
+            }
+            if (e.clientX > window.innerWidth / 2) {
+                nextSlide();
+            } else {
+                previousSlide();
+            }
+        });
+
+        // Initialize
+        showSlide(0);
+    </script>
+</body>
+</html>

@@ -21,18 +21,18 @@ convention is adopted:
 
 ## Schema changes — migrations only, idempotent
 Do NOT create new stray `.sql` files for schema/behavior changes. Add every change
-as an idempotent migration under `Snorlax/migrations/` (`NNN_short_description.sql`,
+as an idempotent migration under `Snorlax/schema/migrations/` (`NNN_short_description.sql`,
 applied in order by `--migrate`). Editing an existing `schema/*.sql` file in place
 is fine; *new* objects/changes belong in a migration. Every migration must be safe
 to re-run (`CREATE ... IF NOT EXISTS`, `DROP ... IF EXISTS`, `CREATE OR REPLACE`,
 `ALTER ... ADD COLUMN IF NOT EXISTS`, `ReplacingMergeTree` + `FINAL`).
 
-Run/rebuild SQL with `Snorlax/migrations/run_sql.py` (reuses `producer/.env`):
+Run/rebuild SQL with `Snorlax/schema/migrations/run_sql.py` (reuses `producer/.env`):
 - `python run_sql.py --reset --build` — drop everything, then recreate the schema.
 - `python run_sql.py --build` / `--all` / `--migrate` — recreate structure / full
   offline pipeline / apply ordered migrations.
 - `python run_sql.py -i` (interactive REPL) · `-c "SQL"` (inline) · `file.sql ...`.
-`migrations/reset.sql` drops all objects and runs only via `--reset` (never `--migrate`).
+`schema/migrations/reset.sql` drops all objects and runs only via `--reset` (never `--migrate`).
 
 ## Keep docs current
 `Snorlax/README.md` is the submission's user-facing doc — update it whenever the
@@ -115,4 +115,21 @@ are ad-hoc READ tools (unnumbered, not part of the pipeline).
 session-independent + extended-dims INSERT jobs; their DDL lives in
 `01_schema.sql`) → `05_compare.sql` → `06_verify.sql`.
 
-SQL not yet executed on a live ClickHouse — expect minor engine fixes on first run.
+### Concrete commands (run from `Snorlax/schema/migrations/`)
+```
+python run_sql.py --reset --build   # drop everything, recreate config UDFs + schema
+# 02_seed.sql needs the raw content CSV + content_dict load in place — wait for
+# that upload before continuing.
+python run_sql.py ../02_seed.sql
+python run_sql.py ../03_backfill.sql
+python run_sql.py ../04_approaches.sql
+python run_sql.py ../05_compare.sql   # expect zero mismatches
+python run_sql.py ../06_verify.sql
+cd ../../benchmark && python benchmark.py   # PASS/FAIL correctness check vs ground truth
+```
+(`--all` runs `02`-`06` back to back once the seed data is in place; use the
+step-by-step form when pausing for data uploads or debugging a single stage.)
+
+`--reset --build` (config UDFs + schema/MVs) has been run successfully against
+the live ClickHouse Cloud instance; `02`-`06` + benchmark are pending the raw
+content/content_dict upload.

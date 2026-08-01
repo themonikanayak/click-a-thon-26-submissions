@@ -47,6 +47,9 @@ CSV/producer → Redpanda → ClickPipes → events_incoming ─(MV)→ events_r
 - **Absolute concurrency per `(dims, minute)`** — no cumulative sum, no carry-in,
   no base term. Every query is `filter → sum → max/avg`, the simplest correct form.
   Instantaneous counts are additive across dimensions (verified on the data).
+  `platform`/`user_id` can legitimately vary *within* a session (e.g. a device
+  switch), so both ride per-interval in `session_intervals` rather than being
+  approximated as one value per session — see `plan/PLAN.md` §9.
 - **One active definition, a state machine per session.** `VideoSessionStart`,
   `VideoPlay`, `AppForegrounded`, `resume`, `speed-resume`, `AdResume` activate;
   `pause`, `speed-pause`, `AppBackgrounded`, `VideoSessionEnd`, `VideoError`,
@@ -105,10 +108,10 @@ forked instances (`PRODUCER_PROCESSES`) from a single command.
 ### 1. Set tunable knobs, then build the schema
 `schema/00_config.sql` is the single place for tunable parameters (bucket width,
 heartbeat/gap tolerance), exposed as SQL UDFs. The easiest way to build (or
-**drop-and-recreate**) the schema is the SQL runner in `migrations/`, which reuses
-the producer's `.env` credentials:
+**drop-and-recreate**) the schema is the SQL runner in `schema/migrations/`, which
+reuses the producer's `.env` credentials:
 ```bash
-cd Snorlax/producer && source .venv/bin/activate && cd ../migrations
+cd Snorlax/producer && source .venv/bin/activate && cd ../schema/migrations
 python run_sql.py --reset --build     # drop everything, then recreate 00_config.sql + 01_schema.sql
 python run_sql.py --all               # OR: full offline pipeline (build → seed → backfill → approaches → compare → verify)
 ```
@@ -122,9 +125,9 @@ clickhouse client --host <host> --user default --secure --queries-file Snorlax/s
 clickhouse client --host <host> --user default --secure --queries-file Snorlax/schema/01_schema.sql
 ```
 
-> **Schema changes go in `migrations/`, as idempotent migrations** — do not add
-> new stray `.sql` files. See [`migrations/README.md`](migrations/README.md) for
-> the runner (`--reset`, `--build`, `--all`, `--migrate`, `-i` REPL, `-c` inline)
+> **Schema changes go in `schema/migrations/`, as idempotent migrations** — do not
+> add new stray `.sql` files. See [`schema/migrations/README.md`](schema/migrations/README.md)
+> for the runner (`--reset`, `--build`, `--all`, `--migrate`, `-i` REPL, `-c` inline)
 > and the migration convention.
 
 ### 2. Get data in
@@ -137,7 +140,11 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env        # then fill in your ClickHouse credentials
 python produce_events.py    # Ctrl-C to stop (flushes buffered rows first)
+```
 
+The producer self-seeds the `content_dim` table with its content catalog (content_ids 1001–3004) on each startup, so the `content_dict` dictionary is ready for `dictGet` lookups without a separate seed step.
+
+```bash
 # High volume: EVENTS_PER_SECOND is the PER-WORKER rate (0 = unthrottled).
 # Aggregate ≈ EVENTS_PER_SECOND × PRODUCER_THREADS × PRODUCER_PROCESSES.
 EVENTS_PER_SECOND=0 PRODUCER_THREADS=16 PRODUCER_PROCESSES=4 python produce_events.py
@@ -201,7 +208,7 @@ Snorlax/
                           (numbered read/write pipeline: 00-04 = WRITE/build,
                           05-06 = READ/validate; ui_queries.sql + tuning_variants.sql
                           are ad-hoc READ tools, unnumbered)
-  migrations/          ← SQL runner (run_sql.py) + reset.sql + idempotent migrations
+    migrations/        ← SQL runner (run_sql.py) + reset.sql + idempotent migrations
   benchmark/           ← correctness harness (benchmark.py) + BENCHMARK_QUERIES.md
 ```
 The problem statement and design background live in `SonyLiv/` (docs only — no code).

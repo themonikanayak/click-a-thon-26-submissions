@@ -26,7 +26,7 @@ Usage:
     python run_sql.py --migrate
 
     # Run specific .sql file(s), in order:
-    python run_sql.py ../schema/00_config.sql ../schema/01_schema.sql
+    python run_sql.py ../00_config.sql ../01_schema.sql
 
     # One-off inline command:
     python run_sql.py -c "SELECT count() FROM sonyliv_concurrency.events_raw"
@@ -46,11 +46,11 @@ import clickhouse_connect
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Paths — this script lives in Snorlax/migrations/.
+# Paths — this script lives in Snorlax/schema/migrations/.
 # ---------------------------------------------------------------------------
-HERE = Path(__file__).resolve().parent          # .../Snorlax/migrations
-SNORLAX = HERE.parent                            # .../Snorlax
-SCHEMA_DIR = SNORLAX / "schema"
+HERE = Path(__file__).resolve().parent          # .../Snorlax/schema/migrations
+SCHEMA_DIR = HERE.parent                         # .../Snorlax/schema
+SNORLAX = SCHEMA_DIR.parent                      # .../Snorlax
 PRODUCER_ENV = SNORLAX / "producer" / ".env"
 
 # Load the producer's .env first (the canonical credentials), then any .env in
