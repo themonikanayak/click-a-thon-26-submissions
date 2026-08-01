@@ -136,7 +136,6 @@ SELECT
   (SELECT count() FROM reference_session_minutes AS r
      LEFT ANTI JOIN oracle_session_minutes AS o
      ON r.video_session_id = o.video_session_id AND r.minute = o.minute) AS reference_only_count;
-  -- both 0 = correct (Nirad's bar: N/N identical, interval-by-interval)
 
 -- ---------------------------------------------------------------------
 -- B) PER-SESSION DEDUPE probe: a session's own array can still list >1
