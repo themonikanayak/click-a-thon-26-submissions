@@ -350,7 +350,7 @@ FROM
   FROM per_island
   GROUP BY sid
 ) AS sess
-LEFT JOIN sonyliv_concurrency.content_dim FINAL AS cd USING (content_id);
+LEFT JOIN sonyliv_concurrency.content_dim AS cd FINAL USING (content_id);
 
 -- D3. session_intervals → concurrency_hot_abs (recent minutes, absolute). 30s REPLACE.
 DROP VIEW IF EXISTS sonyliv_concurrency.concurrency_hot_abs_mv;

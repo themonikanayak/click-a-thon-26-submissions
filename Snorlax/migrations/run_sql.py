@@ -287,10 +287,30 @@ def main() -> int:
 
     # One client + session for the whole run, so TEMPORARY TABLEs and other
     # session state persist across the split statements (e.g. backfill's _wm).
-    client = clickhouse_connect.get_client(
-        host=HOST, port=PORT, username=USER, password=PASSWORD, secure=SECURE,
-        database=DATABASE, session_id=f"snorlax-runner-{os.getpid()}",
-    )
+    # On a brand-new ClickHouse instance the target database may not exist yet,
+    # which makes the initial connection itself fail (UNKNOWN_DATABASE) before
+    # 01_schema.sql's `CREATE DATABASE IF NOT EXISTS` ever gets to run — so
+    # bootstrap it via the server's default database first, then reconnect.
+    try:
+        client = clickhouse_connect.get_client(
+            host=HOST, port=PORT, username=USER, password=PASSWORD, secure=SECURE,
+            database=DATABASE, session_id=f"snorlax-runner-{os.getpid()}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        if "UNKNOWN_DATABASE" not in str(exc):
+            raise
+        print(f"database {DATABASE!r} does not exist yet — creating it", file=sys.stderr)
+        bootstrap = clickhouse_connect.get_client(
+            host=HOST, port=PORT, username=USER, password=PASSWORD, secure=SECURE,
+        )
+        try:
+            bootstrap.command(f"CREATE DATABASE IF NOT EXISTS `{DATABASE}`")
+        finally:
+            bootstrap.close()
+        client = clickhouse_connect.get_client(
+            host=HOST, port=PORT, username=USER, password=PASSWORD, secure=SECURE,
+            database=DATABASE, session_id=f"snorlax-runner-{os.getpid()}",
+        )
     print(f"connected to {HOST}:{PORT} → {DATABASE}", file=sys.stderr)
 
     errors = 0
