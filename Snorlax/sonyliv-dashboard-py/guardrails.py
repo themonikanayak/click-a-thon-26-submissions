@@ -24,7 +24,13 @@ _PROXY_VARS = (
     "all_proxy",
 )
 
-for _var in _PROXY_VARS:
-    _value = os.environ.get(_var, "")
-    if "bloomberg" in _value.lower():
-        del os.environ[_var]
+# Escape hatch: set ALLOW_BLOOMBERG_PROXY=1 to KEEP the proxy env vars in place
+# (e.g. when the only route to ClickHouse Cloud is via the corporate proxy). The
+# secure default remains "strip"; you must opt in explicitly.
+_ALLOW_PROXY = os.environ.get("ALLOW_BLOOMBERG_PROXY", "").lower() in ("1", "true", "yes")
+
+if not _ALLOW_PROXY:
+    for _var in _PROXY_VARS:
+        _value = os.environ.get(_var, "")
+        if "bloomberg" in _value.lower():
+            del os.environ[_var]

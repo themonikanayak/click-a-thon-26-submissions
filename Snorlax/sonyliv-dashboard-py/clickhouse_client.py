@@ -60,6 +60,10 @@ def get_client() -> tuple[Client, str]:
         username=os.getenv("CLICKHOUSE_USER", "default"),
         password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
         secure=os.getenv("CLICKHOUSE_SECURE", "true").lower() in ("1", "true", "yes"),
+        # Verify the server cert by default. Set CLICKHOUSE_VERIFY=false only when
+        # a TLS-intercepting corporate proxy presents its own CA (certifi won't
+        # trust it) — the hop to the proxy is already on a trusted network.
+        verify=os.getenv("CLICKHOUSE_VERIFY", "true").lower() in ("1", "true", "yes"),
         connect_timeout=15,
         send_receive_timeout=30,
         # Keep dashboard queries snappy and bounded (mirrors the React app).
