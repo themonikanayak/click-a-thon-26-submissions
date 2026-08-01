@@ -34,21 +34,24 @@ DROP VIEW IF EXISTS sonyliv_concurrency.mv_session_intervals;
 CREATE MATERIALIZED VIEW sonyliv_concurrency.mv_session_intervals
 REFRESH EVERY 30 SECOND TO sonyliv_concurrency.session_intervals EMPTY AS
 -- Column order MUST match session_intervals (positional MV insert):
--- video_session_id, user_id, interval_idx, active_start, active_end, is_provisional,
+-- video_session_id, user_id, intervals, is_provisional,
 -- content_id, platform, country, video_type, category, title, version.
-SELECT video_session_id, user_id, interval_idx, active_start, active_end,
-       toUInt8(active_end >= now() - toIntervalSecond(cfg_gap_timeout_seconds())) AS is_provisional,
-       content_id, platform, country,
-       dictGet('sonyliv_concurrency.content_dict','video_type', content_id) AS video_type,
-       dictGet('sonyliv_concurrency.content_dict','category',   content_id) AS category,
-       dictGet('sonyliv_concurrency.content_dict','title',      content_id) AS title,
+-- Content dims (video_type/category/title) are resolved here from a LEFT JOIN
+-- content_dim, NOT dictGet — a Cloud dictionary reload is node-local, so a
+-- stale replica could otherwise serve wrong dims.
+SELECT sess.video_session_id AS video_session_id,
+       sess.user_id AS user_id,
+       sess.intervals AS intervals,
+       toUInt8(sess.last_active_end >= now() - toIntervalSecond(cfg_gap_timeout_seconds())) AS is_provisional,
+       sess.content_id AS content_id, sess.platform AS platform, sess.country AS country,
+       cd.video_type AS video_type, cd.category AS category, cd.title AS title,
        toUnixTimestamp64Milli(now64(3)) AS version
 FROM
 (
   WITH
   recent AS (
-    SELECT video_session_id FROM sonyliv_concurrency.events_raw
-    GROUP BY video_session_id HAVING max(event_timestamp) >= now() - INTERVAL 20 MINUTE ),
+    SELECT video_session_id FROM sonyliv_concurrency.session_last_seen
+    WHERE last_ts >= now() - INTERVAL 20 MINUTE ),
   per_event AS (
     SELECT video_session_id AS sid, user_id, event_timestamp AS ts, content_id, platform, country,
       -- ACTIVATE (foreground-only). VideoSessionStart SEEDS the session as active from the start — a
@@ -77,16 +80,32 @@ FROM
     FROM collapsed ),
   segments AS (
     SELECT sid, user_id, content_id, platform, country, ts AS seg_start,
-      multiIf(rn=n, addSeconds(ts, cfg_heartbeat_seconds()), dateDiff('second', ts, next_ts) <= cfg_gap_timeout_seconds(), next_ts, addSeconds(ts, cfg_heartbeat_seconds())) AS seg_end
+      -- grace tail + gap timeout come from 00_config.sql (was hardcoded +60s / <=90s);
+      -- already uses dateDiff('second', ...) for an unambiguous unit on the gap test.
+      multiIf(rn=n, addSeconds(ts, cfg_heartbeat_seconds()),
+              dateDiff('second', ts, next_ts) <= cfg_gap_timeout_seconds(), next_ts,
+              addSeconds(ts, cfg_heartbeat_seconds())) AS seg_end
     FROM stated WHERE state_sign = 1 ),
   islands AS (
     SELECT *, if(seg_start > max(seg_end) OVER (PARTITION BY sid ORDER BY seg_start
                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 1, 0) AS new_island
-    FROM segments )
-  SELECT sid AS video_session_id, any(user_id) AS user_id, toUInt16(island_id) AS interval_idx,
-         min(seg_start) AS active_start, max(seg_end) AS active_end,
+    FROM segments ),
+  per_island AS (
+    SELECT sid, island_id, min(seg_start) AS istart, max(seg_end) AS iend,
+           any(user_id) AS user_id,
+           any(content_id) AS content_id, any(platform) AS platform, any(country) AS country
+    FROM (SELECT *, sum(new_island) OVER (PARTITION BY sid ORDER BY seg_start
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS island_id FROM islands)
+    GROUP BY sid, island_id HAVING iend > istart )
+  -- Collapse a session's islands into one array-typed row — see the
+  -- session_intervals table comment: this is what makes a shrunk island
+  -- count (fewer islands than the previous refresh) unable to leave stale
+  -- rows behind under FINAL.
+  SELECT sid AS video_session_id, any(user_id) AS user_id,
+         arraySort(iv -> iv.1, groupArray((istart, iend))) AS intervals,
+         max(iend) AS last_active_end,
          any(content_id) AS content_id, any(platform) AS platform, any(country) AS country
-  FROM (SELECT *, sum(new_island) OVER (PARTITION BY sid ORDER BY seg_start
-             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS island_id FROM islands)
-  GROUP BY sid, island_id HAVING active_end > active_start
-);
+  FROM per_island
+  GROUP BY sid
+) AS sess
+LEFT JOIN sonyliv_concurrency.content_dim AS cd FINAL USING (content_id);

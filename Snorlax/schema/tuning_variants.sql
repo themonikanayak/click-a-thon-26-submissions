@@ -68,6 +68,6 @@ FROM (
                  toStartOfMinute(active_start),
                  toStartOfMinute(active_end - INTERVAL 1 MILLISECOND)) + 1)) AS number
 ) AS x
-LEFT JOIN sonyliv_concurrency.content_dim FINAL AS cd USING (content_id)
+LEFT JOIN sonyliv_concurrency.content_dim AS cd FINAL USING (content_id)
 GROUP BY country, platform, video_type, category, minute, content_id
 ORDER BY minute;

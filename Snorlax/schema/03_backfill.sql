@@ -91,7 +91,7 @@ FROM
   FROM per_island
   GROUP BY sid
 ) AS sess
-LEFT JOIN sonyliv_concurrency.content_dim FINAL AS cd USING (content_id);
+LEFT JOIN sonyliv_concurrency.content_dim AS cd FINAL USING (content_id);
 
 -- watermark (HOT_WINDOW = cfg_hot_window_seconds(), 00_config.sql; default 600 = old 10 min)
 CREATE TEMPORARY TABLE _wm AS

@@ -102,7 +102,7 @@ SELECT
   uniqExactIf(e.video_session_id, e.event_type = 'VideoSessionStart') AS sessions_started,
   uniqExactIf(e.video_session_id, e.event_type = 'VideoSessionEnd')   AS sessions_ended
 FROM sonyliv_concurrency.events_raw AS e
-LEFT JOIN sonyliv_concurrency.content_dim FINAL AS cd USING (content_id)
+LEFT JOIN sonyliv_concurrency.content_dim AS cd FINAL USING (content_id)
 WHERE e.event_timestamp BETWEEN from_ts AND to_ts
   AND (e.platform  = {platform:String}    OR {platform:String}    = '')
   AND (e.country   = {country:String}     OR {country:String}     = '')
@@ -131,7 +131,7 @@ SELECT minute,
 FROM (
   SELECT toStartOfInterval(e.event_timestamp, toIntervalSecond(cfg_bucket_seconds())) AS minute, e.video_session_id, e.event_type
   FROM sonyliv_concurrency.events_raw AS e
-  LEFT JOIN sonyliv_concurrency.content_dim FINAL AS cd USING (content_id)
+  LEFT JOIN sonyliv_concurrency.content_dim AS cd FINAL USING (content_id)
   WHERE e.event_timestamp BETWEEN from_ts AND to_ts
     AND (e.platform  = {platform:String}    OR {platform:String}    = '')
     AND (e.country   = {country:String}     OR {country:String}     = '')
