@@ -1,0 +1,26 @@
+services:
+  api:
+    env_file:
+      - .env
+    environment:
+      PROXY: ""
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: "localhost,127.0.0.1,::1,mongodb,chat-mongodb,meilisearch,chat-meilisearch,rag_api,vectordb,api,ollama,host.docker.internal"
+      no_proxy: "localhost,127.0.0.1,::1,mongodb,chat-mongodb,meilisearch,chat-meilisearch,rag_api,vectordb,api,ollama,host.docker.internal"
+    volumes:
+      - ./librechat.yaml:/app/librechat.yaml
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: always
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  ollama_data:

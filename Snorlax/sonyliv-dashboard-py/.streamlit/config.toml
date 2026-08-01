@@ -1,0 +1,11 @@
+# ClickHouse-inspired theme: signature yellow on near-black.
+[theme]
+base = "dark"
+primaryColor = "#faff69"
+backgroundColor = "#161619"
+secondaryBackgroundColor = "#1f1f24"
+textColor = "#f4f4f2"
+font = "sans serif"
+
+[server]
+headless = true
