@@ -1,9 +1,10 @@
+-- [WRITE — setup] step 00 of the offline pipeline. Tunable knobs (SQL UDFs); run FIRST, re-run after any change.
 -- #####################################################################
--- config.sql — TUNABLE KNOBS, one place. Run this ONCE before the build
--- files (schema.sql / backfill_history.sql / approach_*.sql / verify.sql),
+-- 00_config.sql — TUNABLE KNOBS, one place. Run this ONCE before the build
+-- files (01_schema.sql / 03_backfill.sql / approach_*.sql / 06_verify.sql),
 -- and re-run it whenever you change a value, then re-run the build.
 --
---   clickhouse client --host <h> --user default --secure --queries-file config.sql
+--   clickhouse client --host <h> --user default --secure --queries-file 00_config.sql
 --
 -- WHY SQL UDFs (not a config table): these knobs are used inside
 -- toStartOfInterval(...) and INTERVAL expressions, which ClickHouse requires
@@ -20,6 +21,7 @@ DROP FUNCTION IF EXISTS cfg_gap_timeout_seconds;
 DROP FUNCTION IF EXISTS cfg_bucket_seconds;
 DROP FUNCTION IF EXISTS cfg_heartbeat_seconds;
 DROP FUNCTION IF EXISTS cfg_missing_heartbeat_buffer_seconds;
+DROP FUNCTION IF EXISTS cfg_hot_window_seconds;
 DROP FUNCTION IF EXISTS norm_lang;
 DROP FUNCTION IF EXISTS norm_dim;
 
@@ -63,6 +65,23 @@ CREATE FUNCTION cfg_missing_heartbeat_buffer_seconds AS () -> 30;
 -- ---------------------------------------------------------------------
 CREATE FUNCTION cfg_gap_timeout_seconds AS () -> cfg_heartbeat_seconds() + cfg_missing_heartbeat_buffer_seconds();
 
+-- ---------------------------------------------------------------------
+-- KNOB 4 — HOT→COLD ROLLOVER WINDOW  (was hardcoded 10 min literals)
+-- How many seconds of the most-recent buckets stay in the HOT tier
+-- (mutable, REPLACE-recomputed each cycle) before they roll over into the
+-- frozen COLD tier. A bucket rolls to cold once it is older than
+-- now() - this many seconds; the serving view (concurrency_now) reads hot
+-- only for minutes newer than max(cold minute), so the tiers stay disjoint.
+--   600  = 10 minutes (default; matches the original hardcoded window)
+--   Wider  = more correctness slack for late/out-of-order data (bigger hot
+--            recompute); Narrower = faster hot reads, less late-data tolerance.
+-- Size to p99 heartbeat/ingest lag (measure via ClickStack). This IS UDF-able
+-- because it sits inside toIntervalSecond(...) (a constant-folding UDF), unlike
+-- the REFRESH cadence which must stay a literal (see below). The derivation
+-- lookback (01_schema.sql D2, INTERVAL 20 MINUTE) MUST stay larger than this.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION cfg_hot_window_seconds AS () -> 600;
+
 -- =====================================================================
 -- DIMENSION NORMALIZATION  (applied at INGEST — the edge, per PLAN §9)
 -- The raw data has case/format-split dimension values that would fragment
@@ -94,6 +113,7 @@ SELECT cfg_bucket_seconds()                    AS bucket_seconds,
        cfg_heartbeat_seconds()                 AS heartbeat_seconds,
        cfg_missing_heartbeat_buffer_seconds()  AS missing_heartbeat_buffer_seconds,
        cfg_gap_timeout_seconds()               AS gap_timeout_seconds,
+       cfg_hot_window_seconds()                AS hot_window_seconds,
        norm_lang('HIN')                        AS ex_hin,          -- -> hin
        norm_lang('hin-hindi')                  AS ex_hin_hindi,    -- -> hin
        norm_lang('')                           AS ex_empty_lang,   -- -> unk
@@ -103,12 +123,12 @@ SELECT cfg_bucket_seconds()                    AS bucket_seconds,
 -- OTHER TUNING KNOBS (NOT UDF-able — documented here, set where they live)
 --   These sit in `REFRESH EVERY` / `INTERVAL` literals that ClickHouse will
 --   not accept a function for, so change them at the source file:
---   * HOT window (recent, mutable minutes) ...... schema.sql D3 / backfill_history.sql
---       `INTERVAL 10 MINUTE`  — size to p99 heartbeat lag (ClickStack).
---   * Derivation lookback (recently-active sessions) ... schema.sql D2
---       `INTERVAL 20 MINUTE`  — must exceed the hot window.
---   * Refresh cadence ........................... schema.sql D2/D3
+--   * Derivation lookback (recently-active sessions) ... 01_schema.sql D2
+--       `INTERVAL 20 MINUTE`  — must exceed cfg_hot_window_seconds().
+--   * Refresh cadence ........................... 01_schema.sql D2/D3
 --       `REFRESH EVERY 1 MINUTE` / `EVERY 30 SECOND`.
---   * events_raw retention ...................... schema.sql
+--   * events_raw retention ...................... 01_schema.sql
 --       `TTL ... + INTERVAL 30 DAY`.
+--   (The HOT→COLD rollover window is now the UDF cfg_hot_window_seconds() above —
+--    it lives inside toIntervalSecond(...), so it folds to a constant.)
 -- =====================================================================

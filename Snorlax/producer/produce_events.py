@@ -131,7 +131,7 @@ def _rand_id(n: int = 12) -> str:
 
 # Inactive sub-states and the (event_type, event) pair that re-activates each one.
 # The activate/deactivate vocabulary matches the pipeline's state machine
-# (see schema.sql: VideoPlay/AppForegrounded/resume/speed-resume/AdResume = +1;
+# (see 01_schema.sql: VideoPlay/AppForegrounded/resume/speed-resume/AdResume = +1;
 #  AppBackgrounded/VideoSessionEnd/VideoError/pause/speed-pause/AdPause = -1).
 INACTIVE_STATES = {
     "backgrounded": ("AppForegrounded", "resume"),      # app sent to background
@@ -183,8 +183,18 @@ class Session:
         active interval must be capped by the watermark, not left open forever.
         """
         if self.state == "start":
-            self.state = "playing"
+            # A real session opens with VideoSessionStart immediately followed by
+            # VideoPlay (see 02_seed.sql / dataset_details.md). Emit both, in
+            # order, so generated data matches that convention. (The pipeline also
+            # seeds a session active from VideoSessionStart, so it's correct even
+            # if a real feed omits/delays VideoPlay — but the producer shouldn't
+            # rely on that.)
+            self.state = "started"
             return self._row("VideoSessionStart", "start", now_ms), False
+
+        if self.state == "started":
+            self.state = "playing"
+            return self._row("VideoPlay", "Play", now_ms), False
 
         if self.state == "playing":
             roll = random.random()

@@ -4,8 +4,10 @@ This doc is referenced by `CLAUDE.md` and applies to **all** SQL in `Snorlax/`.
 Engine: **ClickHouse Cloud**. Database: **`sonyliv_concurrency`**. The design is
 absolute concurrency per `(dims, minute)` served by `concurrency_now` (cold ∪ hot).
 When writing or editing SQL, match the conventions already established in
-`schema/schema.sql`, `schema/approach_session_aware.sql`, and
-`schema/approach_session_independent.sql`.
+`schema/01_schema.sql` and `schema/04_approaches.sql` (the session-aware and
+session-independent INSERT jobs). `schema/` is a numbered read/write pipeline:
+`00`-`04` are the WRITE/build steps, `05`-`06` are READ/validate, and
+`ui_queries.sql` + `tuning_variants.sql` are ad-hoc READ tools.
 
 ---
 
@@ -103,7 +105,7 @@ When writing or editing SQL, match the conventions already established in
   evidence, not a guess.
 - **Avoid JOINs on the hot path.** Enrich `content_id → video_type/category` with the
   `content_dict` dictionary via `dictGet('sonyliv_concurrency.content_dict', …)`,
-  as the MVs and `approach_session_independent.sql` do. Reserve `content_dim` (the
+  as the MVs and the session-independent job in `04_approaches.sql` do. Reserve `content_dim` (the
   dictionary source) for a JOIN fallback only.
 
 ---
@@ -130,7 +132,7 @@ When writing or editing SQL, match the conventions already established in
 ## 6. Correctness & verification
 
 - **Always keep a brute-force reference that must match with 0 mismatches.**
-  `schema/compare_approaches.sql` asserts session-aware == session-independent (and
+  `schema/05_compare.sql` asserts session-aware == session-independent (and
   both == `concurrency_now`) per `(dims, minute)`. Any new metric needs an independent
   reference query and an expected-zero-diff assertion (PLAN §8).
 - **UTC everywhere, one `toTimeZone` at the edge.** All minute buckets are `'UTC'`;
@@ -153,18 +155,19 @@ When writing or editing SQL, match the conventions already established in
   `ReplacingMergeTree` + `FINAL` for retry-safe writes. Re-running must not
   double-count or error.
 - **Document run order in the file header.** Each `schema/*.sql` opens with a banner
-  giving its place in the pipeline. The canonical offline order is:
-  `config.sql` → `schema.sql` → load events → `backfill_history.sql` →
-  `approach_session_aware.sql` → `approach_session_independent.sql` →
-  `approach_extended_dims.sql` → `compare_approaches.sql` → `verify.sql`.
-  Keep new files consistent with this.
+  giving its place in the pipeline (`schema/` is a numbered read/write pipeline:
+  `00`-`04` WRITE/build, `05`-`06` READ/validate). The canonical offline order is:
+  `00_config.sql` → `01_schema.sql` → load events → `03_backfill.sql` →
+  `04_approaches.sql` (one file: session-aware + session-independent +
+  extended-dims INSERT jobs; DDL lives in `01_schema.sql`) →
+  `05_compare.sql` → `06_verify.sql`. Keep new files consistent with this.
 - **Dimension normalization lives at the edge.** The 4 extended drill-down dims
   (`app_version`, `player_version`, `audio_language`, `subtitle_language`) are
-  normalized in `config.sql` (`norm_lang`/`norm_dim`) and applied ONCE at ingest
-  (`mv_incoming_to_raw` + `load_sample_csv.sql`), never re-derived downstream. The
+  normalized in `00_config.sql` (`norm_lang`/`norm_dim`) and applied ONCE at ingest
+  (`mv_incoming_to_raw`), never re-derived downstream. The
   extended serving table `concurrency_ext_abs` is kept separate from the lean core
   tiers (PLAN §9 Fix #7); a core-only query must not pay for the extra dims.
-- **Config over magic numbers.** Gap/grace/bucket constants come from `config.sql`
+- **Config over magic numbers.** Gap/grace/bucket constants come from `00_config.sql`
   helpers (`cfg_gap_timeout_seconds()`, `cfg_heartbeat_seconds()`,
   `cfg_bucket_seconds()`), not inline literals — change the knob in one place.
 - **SQL is not yet executed on live ClickHouse** — expect minor engine fixes on first

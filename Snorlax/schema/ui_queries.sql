@@ -1,3 +1,4 @@
+-- [READ — serve] not a pipeline step; ad-hoc dashboard / insight queries (run explicitly).
 -- #####################################################################
 -- ui_queries.sql — live insight / dashboard queries.
 -- Concurrency reads the absolute serving view: filter -> sum -> max/avg.
@@ -40,11 +41,17 @@ SELECT min(minute) AS min_ts, max(minute) AS max_ts FROM sonyliv_concurrency.con
 
 -- =====================================================================
 -- 1) CONCURRENCY CURVE (minute grain, filtered)
+--    concurrency       = distinct SESSIONS (sum of concurrent).
+--    user_concurrency  = distinct USERS (sum of concurrent_users). EXACT when the
+--      filter pins to one content_id / dim cell; summed across content/dims it can
+--      slightly overcount a user watching >1 content at once (see cold_abs comment
+--      in 01_schema.sql). For an EXACT global distinct-user count, count uniqExact
+--      (user_id) off events_raw as in query 2's "new users".
 -- =====================================================================
 WITH
   coalesce(parseDateTimeBestEffortOrNull({from:String},'UTC'), (SELECT min(minute) FROM sonyliv_concurrency.concurrency_now)) AS from_ts,
   coalesce(parseDateTimeBestEffortOrNull({to:String},'UTC'),   (SELECT max(minute) FROM sonyliv_concurrency.concurrency_now)) AS to_ts
-SELECT minute, sum(concurrent) AS concurrency
+SELECT minute, sum(concurrent) AS concurrency, sum(concurrent_users) AS user_concurrency
 FROM sonyliv_concurrency.concurrency_now
 WHERE minute BETWEEN from_ts AND to_ts
   AND (platform  = {platform:String}   OR {platform:String}   = '')
@@ -56,7 +63,7 @@ GROUP BY minute
 -- Fill from the query's resolved range bound, not the filtered slice's first
 -- present row — so a filter that starts mid-range still renders true zero
 -- minutes at the front instead of a misleading gap. Step is the configurable
--- bucket width (config.sql), not a hardcoded minute — must match how `minute`
+-- bucket width (00_config.sql), not a hardcoded minute — must match how `minute`
 -- rows are actually spaced or FILL inserts phantom sub-bucket rows.
 ORDER BY minute WITH FILL FROM from_ts TO to_ts + toIntervalSecond(cfg_bucket_seconds()) STEP toIntervalSecond(cfg_bucket_seconds());
 
@@ -79,7 +86,7 @@ WITH
   )
 SELECT max(c) AS peak_concurrency, argMax(minute, c) AS peak_minute,
        -- avg = sum / (#buckets in range), empty buckets counted as 0. Denominator
-       -- is buckets (config.sql), not minutes, so it stays correct if the bucket
+       -- is buckets (00_config.sql), not minutes, so it stays correct if the bucket
        -- width changes: dateDiff(seconds)/bucket_seconds + 1.
        round(sum(c) / (dateDiff('second', from_ts, to_ts) / cfg_bucket_seconds() + 1), 1) AS avg_concurrency,
        anyLast(c) AS last_minute_concurrency
@@ -192,7 +199,7 @@ WITH
     -- Densify zero-activity minutes BEFORE averaging — without this, minutes
     -- absent from `curve` are silently skipped and avg(c) over-reports (the
     -- same bug Phoenix shipped). max(c) was already fill-safe; only avg was wrong.
-    -- Step = configurable bucket width (config.sql), matching how rows are spaced.
+    -- Step = configurable bucket width (00_config.sql), matching how rows are spaced.
     ORDER BY minute WITH FILL FROM from_ts TO to_ts + toIntervalSecond(cfg_bucket_seconds()) STEP toIntervalSecond(cfg_bucket_seconds())
   )
 SELECT toStartOfHour(minute) AS hour,        -- toStartOfDay for day grain
@@ -212,9 +219,9 @@ ORDER BY event_time DESC LIMIT 5;
 -- =====================================================================
 -- 7) EXTENDED DRILL-DOWN — curve + peak/avg filtered on ANY dim, including the
 --    drill-down dims (app_version, audio_language, subtitle_language,
---    player_version). Reads concurrency_ext_abs (approach_extended_dims.sql),
+--    player_version). Reads concurrency_ext_abs (04_approaches.sql),
 --    NOT the lean core tiers. EMPTY '' = "all" for every filter. Language values
---    are normalized (config.sql), so pass e.g. 'hin' (not 'HIN'/'hin-hindi').
+--    are normalized (00_config.sql), so pass e.g. 'hin' (not 'HIN'/'hin-hindi').
 -- =====================================================================
 WITH
   coalesce(parseDateTimeBestEffortOrNull({from:String},'UTC'), (SELECT min(minute) FROM sonyliv_concurrency.concurrency_ext_abs)) AS from_ts,
@@ -237,7 +244,7 @@ WITH
     GROUP BY minute
   )
 SELECT max(c) AS peak_concurrency, argMax(minute, c) AS peak_minute,
-       -- avg over #buckets in range, empty buckets = 0 (bucket width from config.sql)
+       -- avg over #buckets in range, empty buckets = 0 (bucket width from 00_config.sql)
        round(sum(c) / (dateDiff('second', from_ts, to_ts) / cfg_bucket_seconds() + 1), 1) AS avg_concurrency
 FROM curve;
 
@@ -246,3 +253,4 @@ SELECT DISTINCT app_version       FROM sonyliv_concurrency.concurrency_ext_abs O
 SELECT DISTINCT audio_language    FROM sonyliv_concurrency.concurrency_ext_abs ORDER BY audio_language;
 SELECT DISTINCT subtitle_language FROM sonyliv_concurrency.concurrency_ext_abs ORDER BY subtitle_language;
 SELECT DISTINCT player_version    FROM sonyliv_concurrency.concurrency_ext_abs ORDER BY player_version;
+SELECT DISTINCT content_id, title FROM sonyliv_concurrency.concurrency_ext_abs ORDER BY title LIMIT 1000;  -- title is a keyed dim here

@@ -1,13 +1,8 @@
+-- [READ — serve] not a pipeline step; offline knob-sweep exploration (run explicitly).
 -- #####################################################################
 -- tuning_variants.sql — offline knob-sweep for the three unhedged
--- coin-flips the review flagged (COMPETITIVE_REVIEW.md #4):
---   * AppForegrounded as a resume (+1) vs not (sonyliv found 13,382/14,256
---     foregrounds leave playback stopped)
---   * grace period after the last active event: 0s vs our default 60s
---   * heartbeat-silence gap that ends a stretch: 90s (ours) vs 120s
---     (Nirad's measured p99 heartbeat gap is 96.4s, above our 90s)
---
--- This does NOT change production defaults in schema.sql/backfill_history.sql
+
+-- This does NOT change production defaults in 01_schema.sql/03_backfill.sql
 -- — run it once the real benchmark answers are available, compare each of
 -- the 8 combinations against them, and only then hand-pin the winning
 -- combo back into the production files.

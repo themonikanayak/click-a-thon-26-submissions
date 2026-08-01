@@ -1,9 +1,13 @@
+-- [WRITE — build] step 01 of the offline pipeline; also the live-app schema.
 -- #####################################################################
--- schema.sql — EVERYTHING the live app needs: tables + dictionary + view + MVs.
+-- 01_schema.sql — EVERYTHING the live app needs: tables + dictionary + view + MVs.
+-- This is the SINGLE source of DDL: every table / MV / dictionary is created
+-- here (incl. the comparison-only concurrency_sa_abs / concurrency_si_abs /
+-- concurrency_ext_abs, which 04_approaches.sql only TRUNCATEs + INSERTs into).
 -- Run once. Then point ClickPipes (Redpanda → events_incoming) and read
--- live insights with ui_queries.sql (a.k.a. 04_ui_queries.sql).
+-- live insights with ui_queries.sql.
 --
---   clickhouse client --host <h> --user default --secure --queries-file schema.sql
+--   clickhouse client --host <h> --user default --secure --queries-file 01_schema.sql
 --
 -- Flow: Redpanda → ClickPipes → events_incoming ─(MV)→ events_raw
 --        ─(MV: state machine)→ session_intervals ─(MV: hot)→ concurrency_hot_abs
@@ -17,7 +21,7 @@
 --   * events_raw partitioned monthly + 30d TTL so raw never grows unbounded
 --     (the aggregates live in cold_abs).
 -- COMPUTE (bounded, never rescans history):
---   * Derivation window = 20 min, hot window = 10 min, freeze horizon = 10 min.
+--   * Derivation window = 20 min; hot window = freeze horizon = cfg_hot_window_seconds() (default 600s = 10 min).
 --     Recompute cost ∝ (window × ACTIVE sessions), independent of TOTAL history —
 --     but see the open caveat below re: per-session cost within that window.
 --     Keep windows as TIGHT as p99 heartbeat lag allows (measure via ClickStack).
@@ -71,10 +75,15 @@ ENGINE = Null;   -- MV consumes each insert; nothing stored (leaner). To DEBUG t
 -- Canonical typed events.
 CREATE TABLE IF NOT EXISTS sonyliv_concurrency.events_raw
 (
+    -- content_id is Int64 (not UInt64): the catalog carries a negative placeholder
+    -- ID (review #1), and content_dim/content_dict are Int64 — keep them aligned.
     video_session_id String, user_id String, content_id Int64,
-    event_type Enum8('VideoSessionStart'=1,'VideoPlay'=2,'VideoHeartbeat'=3,
-                     'AppBackgrounded'=4,'AppForegrounded'=5,'VideoSessionEnd'=6,'VideoError'=7,
-                     'VideoPause'=8,'AdBreakStart'=9,'VideoSeek'=10),
+    -- event_type is LowCardinality(String), NOT Enum8: the dataset lists only the
+    -- CURRENT 7 types (VideoSessionStart/VideoPlay/VideoHeartbeat/AppBackgrounded/
+    -- AppForegrounded/VideoSessionEnd/VideoError) and warns more may appear. A strict
+    -- Enum8 would REJECT any unseen-day event_type on ingest; String tolerates new
+    -- values at ~zero cost (LowCardinality keeps the dictionary encoding).
+    event_type LowCardinality(String),
     event LowCardinality(String),
     event_timestamp DateTime64(3,'UTC') CODEC(DoubleDelta, ZSTD(1)),
     session_start_epoch DateTime64(3,'UTC') CODEC(DoubleDelta, ZSTD(1)),
@@ -100,11 +109,15 @@ ENGINE = ReplacingMergeTree ORDER BY content_id;
 -- orphaned high-index rows behind).
 CREATE TABLE IF NOT EXISTS sonyliv_concurrency.session_intervals
 (
-    video_session_id String,
+    -- One row per session (array of intervals). user_id + title are 1:1 with the
+    -- session/content so they ride as plain columns: user_id enables user-level
+    -- concurrency, title makes the content name a keyed dim without cardinality cost.
+    video_session_id String, user_id String,
     intervals Array(Tuple(active_start DateTime64(3,'UTC'), active_end DateTime64(3,'UTC'))),
     is_provisional UInt8 DEFAULT 0,
     content_id Int64, platform LowCardinality(String), country LowCardinality(String),
-    video_type LowCardinality(String), category LowCardinality(String), version UInt64
+    video_type LowCardinality(String), category LowCardinality(String),
+    title String, version UInt64
 )
 ENGINE = ReplacingMergeTree(version) ORDER BY video_session_id
 TTL toDateTime(version/1000) + INTERVAL 3 DAY;   -- bound growth; cold_abs already holds the durable aggregate
@@ -113,14 +126,23 @@ TTL toDateTime(version/1000) + INTERVAL 3 DAY;   -- bound growth; cold_abs alrea
 -- cold = ReplacingMergeTree so a re-fired/retried compaction can't double-count
 -- a minute (one row per (dims,minute) key; read with FINAL). hot is REPLACE-
 -- recomputed wholesale, so plain MergeTree is fine there.
+-- concurrent      = distinct SESSIONS active in the (dims, minute)  = uniqExact(video_session_id)
+-- concurrent_users = distinct USERS    active in the (dims, minute)  = uniqExact(user_id)
+-- Both are exact per cell and for fixed-dimension peak/avg. NOTE: summing
+-- concurrent_users ACROSS dim rows can overcount a user watching >1 content/dim
+-- (the same additivity caveat the session count assumes; a session has ~one
+-- dim-tuple, a user may span several) — for exact cross-dim user rollups switch
+-- to uniqExactState + AggregatingMergeTree.
 CREATE TABLE IF NOT EXISTS sonyliv_concurrency.concurrency_cold_abs
 ( country LowCardinality(String), platform LowCardinality(String), video_type LowCardinality(String),
-  category LowCardinality(String), minute DateTime('UTC'), content_id Int64, concurrent UInt32 )
+  category LowCardinality(String), minute DateTime('UTC'), content_id Int64,
+  concurrent UInt32, concurrent_users UInt32 )
 ENGINE = ReplacingMergeTree ORDER BY (country, platform, video_type, category, minute, content_id);
 
 CREATE TABLE IF NOT EXISTS sonyliv_concurrency.concurrency_hot_abs
 ( country LowCardinality(String), platform LowCardinality(String), video_type LowCardinality(String),
-  category LowCardinality(String), minute DateTime('UTC'), content_id Int64, concurrent UInt32 )
+  category LowCardinality(String), minute DateTime('UTC'), content_id Int64,
+  concurrent UInt32, concurrent_users UInt32 )
 ENGINE = MergeTree ORDER BY (country, platform, video_type, category, minute, content_id);
 
 -- EXTENDED drill-down serving table: the 4 high-cardinality dims
@@ -128,20 +150,43 @@ ENGINE = MergeTree ORDER BY (country, platform, video_type, category, minute, co
 -- the core dims. Kept SEPARATE from the lean core tiers (PLAN §9 Fix #7) so the
 -- common-case dashboard stays fast on the small core key, while drill-down
 -- queries that filter on device/language read this. Absolute per (dims, minute),
--- same model. Populated by approach_extended_dims.sql from session_intervals
+-- same model. Populated by 04_approaches.sql from session_intervals
 -- (offline/scheduled; no live hot/cold tier for the extended path in this version).
 -- ORDER BY keeps the core key as its PREFIX (country,platform,video_type,category)
 -- then adds the extended dims low→high cardinality, so a core-only filter still
 -- uses the leading key, and this table is a clean superset of the core key.
 -- content_id is Int64 (not UInt64) — same negative-sentinel fix as every other
 -- content_id column (review #1): the catalog has a negative placeholder ID.
+-- title sits next to content_id in the key: it is 1:1 with content_id, so it adds
+-- no cardinality but makes the content name a first-class drill-down dimension
+-- here (core tiers still resolve title via dictGet(content_id) at query time).
 CREATE TABLE IF NOT EXISTS sonyliv_concurrency.concurrency_ext_abs
 ( country LowCardinality(String), platform LowCardinality(String), video_type LowCardinality(String),
   category LowCardinality(String), subtitle_language LowCardinality(String),
   audio_language LowCardinality(String), player_version LowCardinality(String),
-  app_version LowCardinality(String), minute DateTime('UTC'), content_id Int64, concurrent UInt32 )
+  app_version LowCardinality(String), minute DateTime('UTC'), content_id Int64, title String,
+  concurrent UInt32, concurrent_users UInt32 )
 ENGINE = MergeTree
-ORDER BY (country, platform, video_type, category, subtitle_language, audio_language, player_version, app_version, minute, content_id);
+ORDER BY (country, platform, video_type, category, subtitle_language, audio_language, player_version, app_version, minute, content_id, title);
+
+-- COMPARISON-ONLY serving tables (no hot/cold tiering) — populated by
+-- 04_approaches.sql (TRUNCATE + INSERT), read/asserted by 05_compare.sql.
+-- Same shape/engine/ORDER BY as concurrency_cold_abs so the two approaches'
+-- outputs are byte-for-byte comparable minute-for-minute. DDL lives HERE (not in
+-- 04) so 01_schema.sql stays the single source of every object.
+--   * concurrency_sa_abs — SESSION-AWARE (expanded from session_intervals).
+--   * concurrency_si_abs — SESSION-INDEPENDENT (per-event state, no interval merge).
+CREATE TABLE IF NOT EXISTS sonyliv_concurrency.concurrency_sa_abs
+( country LowCardinality(String), platform LowCardinality(String), video_type LowCardinality(String),
+  category LowCardinality(String), minute DateTime('UTC'), content_id Int64,
+  concurrent UInt32, concurrent_users UInt32 )
+ENGINE = MergeTree ORDER BY (country, platform, video_type, category, minute, content_id);
+
+CREATE TABLE IF NOT EXISTS sonyliv_concurrency.concurrency_si_abs
+( country LowCardinality(String), platform LowCardinality(String), video_type LowCardinality(String),
+  category LowCardinality(String), minute DateTime('UTC'), content_id Int64,
+  concurrent UInt32, concurrent_users UInt32 )
+ENGINE = MergeTree ORDER BY (country, platform, video_type, category, minute, content_id);
 
 -- One row per session, incrementally kept up to date (fed by mv_session_last_seen
 -- below). Lets D2's "which sessions are recent" lookup read a tiny per-session
@@ -172,10 +217,10 @@ LAYOUT(HASHED()) LIFETIME(MIN 600 MAX 1200);
 -- C. SERVING VIEW (what UI reads) — cold ∪ hot, disjoint by minute
 -- =====================================================================
 CREATE OR REPLACE VIEW sonyliv_concurrency.concurrency_now AS
-SELECT country, platform, video_type, category, minute, content_id, concurrent
+SELECT country, platform, video_type, category, minute, content_id, concurrent, concurrent_users
 FROM sonyliv_concurrency.concurrency_cold_abs FINAL          -- dedup ReplacingMergeTree
 UNION ALL
-SELECT country, platform, video_type, category, minute, content_id, concurrent
+SELECT country, platform, video_type, category, minute, content_id, concurrent, concurrent_users
 FROM sonyliv_concurrency.concurrency_hot_abs
 -- coalesce: an empty cold_abs (pure-live deployment, nothing compacted yet) must
 -- not turn into `minute > NULL`, which would silently filter out every hot row.
@@ -193,7 +238,7 @@ SELECT video_session_id, user_id, content_id, event_type, event,
        fromUnixTimestamp64Milli(session_start_epoch, 'UTC') AS session_start_epoch,
        -- column order MUST match events_raw (positional MV insert):
        -- platform, app_version, country, audio_language, subtitle_language, player_version.
-       -- normalize the 4 extended dims at the edge (config.sql) so events_raw is
+       -- normalize the 4 extended dims at the edge (00_config.sql) so events_raw is
        -- canonical and drill-down filters don't fragment (hin/HIN/hin-hindi):
        platform,
        norm_dim(app_version)        AS app_version,
@@ -229,13 +274,19 @@ SELECT 'country' AS dim, country AS value FROM sonyliv_concurrency.events_raw;
 DROP VIEW IF EXISTS sonyliv_concurrency.mv_session_intervals;
 CREATE MATERIALIZED VIEW sonyliv_concurrency.mv_session_intervals
 REFRESH EVERY 30 SECOND TO sonyliv_concurrency.session_intervals EMPTY AS
+-- Column order MUST match session_intervals (positional MV insert):
+-- video_session_id, user_id, intervals, is_provisional, content_id, platform,
+-- country, video_type, category, title, version. Content dims (incl. title) come
+-- from a LEFT JOIN content_dim, NOT dictGet — a Cloud dictionary reload is
+-- node-local, so a stale replica could otherwise serve wrong dims.
 SELECT sess.video_session_id AS video_session_id,
+       sess.user_id AS user_id,
        sess.intervals AS intervals,
-       -- provisional threshold tied to the same gap timeout (config.sql) used to
+       -- provisional threshold tied to the same gap timeout (00_config.sql) used to
        -- close a stretch, so tuning that one knob keeps this consistent too.
        toUInt8(sess.last_active_end >= now() - toIntervalSecond(cfg_gap_timeout_seconds())) AS is_provisional,
        sess.content_id AS content_id, sess.platform AS platform, sess.country AS country,
-       cd.video_type AS video_type, cd.category AS category,
+       cd.video_type AS video_type, cd.category AS category, cd.title AS title,
        toUnixTimestamp64Milli(now64(3)) AS version
 FROM
 (
@@ -244,18 +295,25 @@ FROM
     SELECT video_session_id FROM sonyliv_concurrency.session_last_seen
     WHERE last_ts >= now() - INTERVAL 20 MINUTE ),
   per_event AS (
-    SELECT video_session_id AS sid, event_timestamp AS ts, content_id, platform, country,
-      multiIf(event_type IN ('VideoPlay','AppForegrounded') OR event IN ('resume','speed-resume','AdResume'), 1,
-              event_type IN ('AppBackgrounded','VideoSessionEnd','VideoError') OR event IN ('pause','speed-pause','AdPause'), -1,
+    SELECT video_session_id AS sid, user_id, event_timestamp AS ts, content_id, platform, country,
+      -- ACTIVATE (foreground-only). VideoSessionStart SEEDS the session as active from the start — a
+      -- session is watching until a pause/bg/error/end stops it — so active heartbeats BEFORE the first
+      -- explicit VideoPlay aren't dropped, and a session that never emits an explicit Play still counts.
+      multiIf(event_type IN ('VideoSessionStart','VideoPlay','AppForegrounded') OR event IN ('resume','speed-resume','AdResume'), 1,
+              -- DEACTIVATE (foreground-only). PAUSE has no coarse event_type in the raw feed — it rides in
+              -- the `event` column ("the actual event", dataset_details.md: pause/speed-pause/AdPause). We
+              -- also match the VideoPause/AdBreakStart pause-family event_types directly, so a pause is caught by
+              -- event_type OR event and a paused-but-heartbeating session can't leak in as active (GAP #2).
+              event_type IN ('AppBackgrounded','VideoSessionEnd','VideoError','VideoPause','AdBreakStart') OR event IN ('pause','speed-pause','AdPause'), -1,
               0) AS transition
     FROM sonyliv_concurrency.events_raw
     WHERE video_session_id IN (SELECT video_session_id FROM recent) ),
   collapsed AS (
     SELECT sid, ts, if(min(transition) < 0, toInt8(-1), toInt8(max(transition))) AS transition,
-           any(content_id) AS content_id, any(platform) AS platform, any(country) AS country
+           any(user_id) AS user_id, any(content_id) AS content_id, any(platform) AS platform, any(country) AS country
     FROM per_event GROUP BY sid, ts ),
   stated AS (
-    SELECT sid, ts, content_id, platform, country,
+    SELECT sid, ts, user_id, content_id, platform, country,
       argMax(transition, if(transition!=0, ts, toDateTime64('1970-01-01 00:00:00',3,'UTC')))
         OVER (PARTITION BY sid ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS state_sign,
       row_number() OVER (PARTITION BY sid ORDER BY ts) AS rn,
@@ -263,8 +321,8 @@ FROM
       leadInFrame(ts) OVER (PARTITION BY sid ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS next_ts
     FROM collapsed ),
   segments AS (
-    SELECT sid, content_id, platform, country, ts AS seg_start,
-      -- grace tail + gap timeout come from config.sql (was hardcoded +60s / <=90s);
+    SELECT sid, user_id, content_id, platform, country, ts AS seg_start,
+      -- grace tail + gap timeout come from 00_config.sql (was hardcoded +60s / <=90s);
       -- already uses dateDiff('second', ...) for an unambiguous unit on the gap test.
       multiIf(rn=n, addSeconds(ts, cfg_heartbeat_seconds()),
               dateDiff('second', ts, next_ts) <= cfg_gap_timeout_seconds(), next_ts,
@@ -276,6 +334,7 @@ FROM
     FROM segments ),
   per_island AS (
     SELECT sid, island_id, min(seg_start) AS istart, max(seg_end) AS iend,
+           any(user_id) AS user_id,
            any(content_id) AS content_id, any(platform) AS platform, any(country) AS country
     FROM (SELECT *, sum(new_island) OVER (PARTITION BY sid ORDER BY seg_start
                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS island_id FROM islands)
@@ -284,7 +343,7 @@ FROM
   -- session_intervals table comment: this is what makes a shrunk island
   -- count (fewer islands than the previous refresh) unable to leave stale
   -- rows behind under FINAL.
-  SELECT sid AS video_session_id,
+  SELECT sid AS video_session_id, any(user_id) AS user_id,
          arraySort(iv -> iv.1, groupArray((istart, iend))) AS intervals,
          max(iend) AS last_active_end,
          any(content_id) AS content_id, any(platform) AS platform, any(country) AS country
@@ -303,10 +362,11 @@ TO sonyliv_concurrency.concurrency_hot_abs EMPTY AS
 -- minute inside it, so this is provably equivalent to the old filter — just
 -- avoids expanding (and scanning) session_intervals' entire history every 30s.
 SELECT country, platform, video_type, category, minute, content_id,
-       toUInt32(uniqExact(video_session_id)) AS concurrent
+       toUInt32(uniqExact(video_session_id)) AS concurrent,
+       toUInt32(uniqExact(user_id))          AS concurrent_users
 FROM (
-  SELECT video_session_id, country, platform, video_type, category, content_id,
-         -- configurable bucket (config.sql): start-of-bucket + N buckets
+  SELECT video_session_id, user_id, country, platform, video_type, category, content_id,
+         -- configurable bucket (00_config.sql): start-of-bucket + N buckets
          toStartOfInterval(active_start, toIntervalSecond(cfg_bucket_seconds()))
            + toIntervalSecond(number * cfg_bucket_seconds()) AS minute
   FROM
@@ -314,7 +374,7 @@ FROM (
     -- unpack session_intervals' one-row-per-session Array(Tuple(...)) first
     -- (ghost-interval fix, review #7) — session_intervals FINAL no longer has
     -- active_start/active_end as plain columns.
-    SELECT video_session_id, country, platform, video_type, category, content_id,
+    SELECT video_session_id, user_id, country, platform, video_type, category, content_id,
            iv.1 AS active_start, iv.2 AS active_end
     FROM sonyliv_concurrency.session_intervals FINAL
     ARRAY JOIN intervals AS iv
@@ -326,7 +386,8 @@ FROM (
                  toStartOfInterval(active_end - INTERVAL 1 MILLISECOND, toIntervalSecond(cfg_bucket_seconds())))
                  / cfg_bucket_seconds()) + 1) AS number
 )
-WHERE minute > toStartOfInterval(now(), toIntervalSecond(cfg_bucket_seconds())) - INTERVAL 10 MINUTE
+-- HOT window from 00_config.sql (cfg_hot_window_seconds, default 600 = old 10 min).
+WHERE minute > toStartOfInterval(now(), toIntervalSecond(cfg_bucket_seconds())) - toIntervalSecond(cfg_hot_window_seconds())
 GROUP BY country, platform, video_type, category, minute, content_id;
 
 -- D4. COLD compaction — now a real scheduled job (previously a commented-out
@@ -337,21 +398,23 @@ GROUP BY country, platform, video_type, category, minute, content_id;
 -- concurrency_cold_abs is ReplacingMergeTree so a retried/overlapping run
 -- can't double-count; the forward-fill guard keeps it idempotent and
 -- append-only (never touches already-frozen minutes), coalesced against an
--- empty cold_abs on the very first run.
+-- empty cold_abs on the very first run. Emits BOTH measures (sessions + users)
+-- to match concurrency_cold_abs / the hot tier.
 DROP VIEW IF EXISTS sonyliv_concurrency.mv_cold_compaction;
 CREATE MATERIALIZED VIEW sonyliv_concurrency.mv_cold_compaction
 REFRESH EVERY 1 MINUTE DEPENDS ON sonyliv_concurrency.concurrency_hot_abs_mv
 TO sonyliv_concurrency.concurrency_cold_abs EMPTY AS
--- Bucket-aware to match D3 (config.sql cfg_bucket_seconds()) — hot and cold
+-- Bucket-aware to match D3 (00_config.sql cfg_bucket_seconds()) — hot and cold
 -- must bucket identically or concurrency_now's cold/hot union misaligns.
 SELECT country, platform, video_type, category, minute, content_id,
-       toUInt32(uniqExact(video_session_id)) AS concurrent
+       toUInt32(uniqExact(video_session_id)) AS concurrent,
+       toUInt32(uniqExact(user_id))          AS concurrent_users
 FROM (
-  SELECT video_session_id, country, platform, video_type, category, content_id,
+  SELECT video_session_id, user_id, country, platform, video_type, category, content_id,
          toStartOfInterval(active_start, toIntervalSecond(cfg_bucket_seconds()))
            + toIntervalSecond(number * cfg_bucket_seconds()) AS minute
   FROM (
-    SELECT video_session_id, country, platform, video_type, category, content_id,
+    SELECT video_session_id, user_id, country, platform, video_type, category, content_id,
            iv.1 AS active_start, iv.2 AS active_end
     FROM sonyliv_concurrency.session_intervals FINAL
     ARRAY JOIN intervals AS iv
