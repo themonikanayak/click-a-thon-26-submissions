@@ -198,7 +198,7 @@ WITH
     GROUP BY minute
     -- Densify zero-activity minutes BEFORE averaging — without this, minutes
     -- absent from `curve` are silently skipped and avg(c) over-reports (the
-    -- same bug Phoenix shipped). max(c) was already fill-safe; only avg was wrong.
+    -- same bug shipped). max(c) was already fill-safe; only avg was wrong.
     -- Step = configurable bucket width (00_config.sql), matching how rows are spaced.
     ORDER BY minute WITH FILL FROM from_ts TO to_ts + toIntervalSecond(cfg_bucket_seconds()) STEP toIntervalSecond(cfg_bucket_seconds())
   )
