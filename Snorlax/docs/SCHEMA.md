@@ -232,4 +232,6 @@ that cycle's new batch every minute instead of accumulating durable history.
 | `06_verify.sql` | READ (validate) | Serving-vs-brute-force, an independently-implemented oracle, pause-exclusion and session-start-seeding invariants |
 | `ui_queries.sql` | READ (ad hoc) | Dashboard queries against `concurrency_now` / `concurrency_ext_abs` |
 | `tuning_variants.sql` | READ (ad hoc) | Sensitivity checks for the `00_config.sql` knobs |
-| `migrations/reset.sql` (`schema/migrations/reset.sql`) | reset (only via `--reset`) | Drops every object |
+| `schema/migrations/001_fix_content_dict_complex_key.sql` | migration | Converts `content_dict` to `COMPLEX_KEY_HASHED` so negative placeholder `content_id`s don't throw |
+| `schema/migrations/002_session_intervals_append_and_platform_per_interval.sql` | migration | Adds `APPEND` to `mv_session_intervals`; moves platform/user_id inside the interval tuple |
+| `schema/migrations/reset.sql` | reset (only via `--reset`) | Drops every object |

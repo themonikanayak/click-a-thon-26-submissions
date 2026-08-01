@@ -241,15 +241,19 @@ TRUNCATE TABLE IF EXISTS sonyliv_concurrency.concurrency_ext_abs;
 INSERT INTO sonyliv_concurrency.concurrency_ext_abs
 WITH per_session_dims AS (
     -- one row per session: its extended dims (already normalized in events_raw).
-    -- any() attributes a session to a single value — unlike platform (now
-    -- tracked per-interval, see session_intervals), these 4 dims are not
-    -- known to vary within a session, so a session that switches audio/device
-    -- mid-stream (rare) is attributed to one value; documented caveat.
+    -- argMax(..., event_timestamp) attributes a session to its LATEST value —
+    -- unlike platform (now tracked per-interval, see session_intervals), these
+    -- 4 dims genuinely vary within a session for the majority of sessions in
+    -- this dataset (measured: ~81% of sessions have >1 distinct audio_language
+    -- across their own events), so a plain any() pick is non-deterministic
+    -- between two independent runs of this same query (e.g. this table vs the
+    -- benchmark's independent reference) and produces spurious cell mismatches.
+    -- Deterministic "latest wins" tie-break instead.
     SELECT video_session_id,
-           any(app_version)       AS app_version,
-           any(player_version)    AS player_version,
-           any(audio_language)    AS audio_language,
-           any(subtitle_language) AS subtitle_language
+           argMax(app_version, event_timestamp)       AS app_version,
+           argMax(player_version, event_timestamp)    AS player_version,
+           argMax(audio_language, event_timestamp)    AS audio_language,
+           argMax(subtitle_language, event_timestamp) AS subtitle_language
     FROM sonyliv_concurrency.events_raw
     GROUP BY video_session_id
 )

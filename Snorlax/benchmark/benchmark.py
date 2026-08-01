@@ -158,16 +158,18 @@ REF_CORE = f"""
 """
 
 # Extended reference: enrich each active bucket with the session's 4 drill-down
-# dims (any() per session, exactly as 04_approaches.sql does) + title,
-# then aggregate to the extended key. Matches concurrency_ext_abs cell-for-cell.
+# dims (argMax(..., event_timestamp) per session — deterministic "latest wins",
+# exactly as 04_approaches.sql does; plain any() is non-deterministic here since
+# ~81% of sessions have >1 distinct value for these dims across their events)
+# + title, then aggregate to the extended key. Matches concurrency_ext_abs cell-for-cell.
 REF_EXT = f"""
 (
   WITH per_session_dims AS (
     SELECT video_session_id,
-           any(app_version)       AS app_version,
-           any(player_version)    AS player_version,
-           any(audio_language)    AS audio_language,
-           any(subtitle_language) AS subtitle_language
+           argMax(app_version, event_timestamp)       AS app_version,
+           argMax(player_version, event_timestamp)    AS player_version,
+           argMax(audio_language, event_timestamp)    AS audio_language,
+           argMax(subtitle_language, event_timestamp) AS subtitle_language
     FROM {DB}.events_raw
     GROUP BY video_session_id
   )
