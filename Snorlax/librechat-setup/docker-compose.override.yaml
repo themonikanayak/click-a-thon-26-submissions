@@ -1,17 +1,27 @@
 services:
   api:
+    # The base compose pins this to registry.librechat.ai (private → HTTP 403).
+    # Override to the PUBLIC ghcr.io image so it pulls without credentials.
+    image: ghcr.io/danny-avila/librechat-dev:latest
     env_file:
       - .env
     environment:
+      # LibreChat itself must NOT use the corporate proxy for its internal calls
+      # (mongo, meilisearch, ollama, the MCP server) — blank them and NO_PROXY the
+      # internal service names.
       PROXY: ""
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       http_proxy: ""
       https_proxy: ""
-      NO_PROXY: "localhost,127.0.0.1,::1,mongodb,chat-mongodb,meilisearch,chat-meilisearch,rag_api,vectordb,api,ollama,host.docker.internal"
-      no_proxy: "localhost,127.0.0.1,::1,mongodb,chat-mongodb,meilisearch,chat-meilisearch,rag_api,vectordb,api,ollama,host.docker.internal"
+      NO_PROXY: "localhost,127.0.0.1,::1,mongodb,chat-mongodb,meilisearch,chat-meilisearch,rag_api,vectordb,api,ollama,mcp-clickhouse,host.docker.internal"
+      no_proxy: "localhost,127.0.0.1,::1,mongodb,chat-mongodb,meilisearch,chat-meilisearch,rag_api,vectordb,api,ollama,mcp-clickhouse,host.docker.internal"
     volumes:
       - ./librechat.yaml:/app/librechat.yaml
+
+  # Same private-registry 403 as `api` — use the public ghcr.io RAG API image.
+  rag_api:
+    image: ghcr.io/danny-avila/librechat-rag-api-dev-lite:latest
 
   ollama:
     image: ollama/ollama:latest
@@ -21,6 +31,48 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    # Ollama needs internet egress to PULL models (e.g. qwen2.5-coder:7b). On a
+    # restricted network the only route out is the corporate proxy; pin its IP so
+    # in-container DNS can't fail. Serving requests to LibreChat stay internal.
+    environment:
+      HTTPS_PROXY: "http://proxy.bloomberg.com:81"
+      HTTP_PROXY: "http://proxy.bloomberg.com:81"
+      NO_PROXY: "localhost,127.0.0.1,api,mcp-clickhouse"
+    extra_hosts:
+      - "proxy.bloomberg.com:69.191.241.9"
+
+  # ClickHouse MCP server — gives LibreChat agents read-only SQL access to the
+  # live sonyliv_concurrency database. Exposes list_databases / list_tables /
+  # run_query (SELECT only; CLICKHOUSE_ALLOW_WRITE_ACCESS stays false).
+  mcp-clickhouse:
+    # Official ClickHouse MCP image. If unavailable in your registry, build it
+    # instead, e.g.:  image: python:3.12-slim  +  command: >
+    #   sh -c "pip install mcp-clickhouse && python -m mcp_clickhouse.main"
+    image: mcp/clickhouse:latest
+    container_name: mcp-clickhouse
+    restart: always
+    environment:
+      # --- ClickHouse Cloud target (via the corporate proxy) ---
+      CLICKHOUSE_HOST: "amerupt3my.ap-south-1.aws.clickhouse.cloud"
+      CLICKHOUSE_PORT: "443"          # proxy ALLOWS 443, BLOCKS 8443
+      CLICKHOUSE_USER: "default"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD}"   # from LibreChat root .env
+      CLICKHOUSE_SECURE: "true"
+      CLICKHOUSE_VERIFY: "false"      # proxy MITMs TLS with its own CA
+      CLICKHOUSE_DATABASE: "sonyliv_concurrency"
+      # --- MCP server transport (HTTP so LibreChat can reach it by service name) ---
+      CLICKHOUSE_MCP_SERVER_TRANSPORT: "http"
+      CLICKHOUSE_MCP_BIND_HOST: "0.0.0.0"
+      CLICKHOUSE_MCP_BIND_PORT: "8000"
+      CLICKHOUSE_MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN}"  # from LibreChat root .env
+      # --- Egress to ClickHouse Cloud goes through the corporate proxy ---
+      HTTPS_PROXY: "http://proxy.bloomberg.com:81"
+      HTTP_PROXY: "http://proxy.bloomberg.com:81"
+      NO_PROXY: "localhost,127.0.0.1,api,ollama"
+    extra_hosts:
+      - "proxy.bloomberg.com:69.191.241.9"
+    ports:
+      - "8000:8000"   # optional: host access for curl-based verification
 
 volumes:
   ollama_data:

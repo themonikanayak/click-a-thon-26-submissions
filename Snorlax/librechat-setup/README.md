@@ -1,132 +1,120 @@
-# LibreChat setup — local Docker + dashboard wiring
+# LibreChat setup — local Docker + ClickHouse MCP + dashboard embed
 
 Run [LibreChat](https://github.com/danny-avila/LibreChat) locally on Docker with
-a **local Ollama** model, then point the SonyLIV dashboard's **Insights Copilot**
-at it. The dashboard calls LibreChat's OpenAI-compatible *remote agents* API, and
-LibreChat runs each turn against Ollama — so the model is local (no paid key) but
-every request flows through LibreChat.
+a **local Ollama** model and a **ClickHouse MCP server**, then embed it as the
+**✨ Copilot** tab of the SonyLIV dashboard. The agent answers viewing-concurrency
+questions by running read-only SQL against `sonyliv_concurrency` **itself** (via
+MCP) — no paid key, everything local.
 
 ```
-Streamlit dashboard  ──POST /api/agents/v1/chat/completions──►  LibreChat (:3080)  ──►  Ollama (:11434)
- (host, :8501)          Authorization: Bearer <agent API key>     docker compose        llama3.2:3b
-                        model = <agent id>
+Dashboard :8501  ──iframe──►  LibreChat :3080
+                                 └─ Agent (model = qwen2.5-coder:7b @ Ollama :11434)
+                                      ├─ Instructions = agent-guidelines.md
+                                      └─ MCP tools ──► mcp-clickhouse :8000
+                                                          └─(proxy :443, verify off)─► ClickHouse Cloud
 ```
 
-LibreChat itself is **not vendored** in git — clone it separately and drop the
-two config files from this folder into its root.
+LibreChat is **not vendored** in git — clone it separately and drop this folder's
+config files into its root.
+
+## Files in this folder
+| File | Purpose |
+|---|---|
+| `docker-compose.override.yaml` | Adds `ollama` + `mcp-clickhouse` services, mounts `librechat.yaml`, blanks the corporate proxy on `api`, and routes the two internet-facing services through the proxy. |
+| `librechat.yaml` | Ollama custom endpoint (`qwen2.5-coder:7b`), `mcpServers.clickhouse`, remote-agents enabled. |
+| `agent-guidelines.md` | Paste into the agent's **Instructions** — schema + how to query correctly. |
 
 ---
 
-## 1. Run LibreChat on Docker
-
-1. **Clone LibreChat** (once), next to `Snorlax/` or wherever you like:
+## 1. Run the stack on Docker
+1. **Clone LibreChat** and copy the two config files into its root:
    ```bash
-   git clone https://github.com/danny-avila/LibreChat.git
-   cd LibreChat
-   ```
-2. **Copy the config** from this folder into the LibreChat root:
-   ```bash
+   git clone https://github.com/danny-avila/LibreChat.git && cd LibreChat
    cp /path/to/Snorlax/librechat-setup/docker-compose.override.yaml .
    cp /path/to/Snorlax/librechat-setup/librechat.yaml .
    ```
-   - `docker-compose.override.yaml` adds an **`ollama`** service (published on
-     `:11434`), mounts `librechat.yaml`, and blanks any `*_PROXY` vars so
-     outbound calls don't try to use a corporate proxy.
-   - `librechat.yaml` defines the **Ollama** custom endpoint
-     (`http://ollama:11434/v1/`, model `llama3.2:3b`) and **enables remote
-     agents** (`interface.remoteAgents`).
-3. **Create a `.env`** in the LibreChat root (holds secrets/host settings, so it
-   is not committed here). Start from LibreChat's own template and generate the
-   required secrets:
+2. **Create `.env`** in the LibreChat root (from `.env.example`) and set:
    ```bash
-   cp .env.example .env
-   # Set at minimum (see .env.example for the rest):
-   #   HOST=0.0.0.0
-   #   PORT=3080
-   #   ALLOW_REGISTRATION=true          # so you can create the first (admin) user
-   #   JWT_SECRET / JWT_REFRESH_SECRET / CREDS_KEY / CREDS_IV / MEILI_MASTER_KEY
+   HOST=0.0.0.0
+   PORT=3080
+   ALLOW_REGISTRATION=true            # to create the first (admin) user
+   # secrets — generate via https://www.librechat.ai/toolkit/creds_generator
+   JWT_SECRET=... ; JWT_REFRESH_SECRET=... ; CREDS_KEY=... ; CREDS_IV=... ; MEILI_MASTER_KEY=...
+   # --- consumed by docker-compose.override.yaml (mcp-clickhouse) ---
+   CLICKHOUSE_PASSWORD=<your ClickHouse Cloud password>
+   MCP_AUTH_TOKEN=<any long random string>     # bearer token LibreChat↔MCP
    ```
-   Generate the secrets with LibreChat's helper: <https://www.librechat.ai/toolkit/creds_generator>
-4. **Start the stack:**
+   `.env` holds secrets — it is **not** committed.
+3. **Start it:**
    ```bash
-   docker compose up -d
+   docker compose up -d          # LibreChat :3080, Ollama :11434, mcp-clickhouse :8000
+   docker compose ps             # all three should be Up
    ```
-   LibreChat comes up at **http://localhost:3080**.
-5. **Pull the model** into the Ollama container (first run only):
+4. **Pull the model** (first run only). Ollama needs internet egress; the override
+   already routes it through the proxy:
    ```bash
-   docker compose exec ollama ollama pull llama3.2:3b
-   ```
-6. **Sanity-check the model endpoint** (optional):
-   ```bash
-   curl http://localhost:11434/api/tags        # should list llama3.2:3b
+   docker compose exec ollama ollama pull qwen2.5-coder:7b
    ```
 
-Open http://localhost:3080, **register the first user** (the first account
-becomes an **admin**, which is what grants the remote-agents permission), pick
-the **Ollama** endpoint, and confirm you can chat. That proves LibreChat → Ollama
-works before you wire the dashboard in.
-
----
-
-## 2. Remote agents — create the agent + API key (one time)
-
-The dashboard needs (a) an **agent id** and (b) an **agent API key**. Both are
-created from the LibreChat UI once remote agents are enabled (already done in
-`librechat.yaml`; re-run `docker compose up -d` if you enabled it after first
-boot).
-
-1. **Create an agent** wired to Ollama:
-   - In LibreChat, open the **Agents** builder.
-   - Set **Endpoint = Ollama**, **Model = `llama3.2:3b`**.
-   - (Optional) give it the Insights Copilot instructions; the dashboard also
-     sends its own system prompt + live context each turn.
-   - Save, then copy the **agent id** (the `agent_...` id in the URL / agent
-     details). This is the `model` the dashboard sends.
-2. **Create an API key** for the remote-agents API:
-   - Go to the **API keys** section (available once `remoteAgents` is enabled),
-     create a key, and copy it. You only see the full key once.
-
-> Prefer the raw API? With an admin JWT you can `POST /api/apiKeys` and
-> `GET /api/agents/v1/models` (lists agents as models). The UI is simpler.
-
----
-
-## 3. Point the dashboard at LibreChat
-
-In `Snorlax/sonyliv-dashboard-py/`, set three env vars (e.g. in that app's
-`.env`), then run the dashboard — full steps in
-[`../sonyliv-dashboard-py/README.md`](../sonyliv-dashboard-py/README.md)
-→ **Connect to LibreChat**:
-
+## 2. Verify the MCP server reaches ClickHouse
+The MCP server connects to ClickHouse Cloud through the corporate proxy on **port
+443** (8443 is blocked) with **`CLICKHOUSE_VERIFY=false`** (the proxy intercepts
+TLS with its own CA). Confirm it's serving and can query:
 ```bash
-LIBRECHAT_URL=http://localhost:3080/api/agents/v1   # default; usually leave as-is
-LIBRECHAT_API_KEY=<the agent API key from step 2>
-LIBRECHAT_AGENT_ID=<the agent id from step 2>
+# reachable on the host (port is published for this check):
+curl -s -H "Authorization: Bearer $MCP_AUTH_TOKEN" http://localhost:8000/mcp -o /dev/null -w "%{http_code}\n"
+# and from inside the network the way LibreChat reaches it:
+docker compose logs mcp-clickhouse   # should show it bound to 0.0.0.0:8000, no ClickHouse errors
 ```
+A `run_query` of `SELECT count() FROM sonyliv_concurrency.concurrency_now` should
+return ~89k (matches the dashboard).
 
-With those set, the Insights Copilot routes through LibreChat. If they're unset
-(or LibreChat is unreachable), it falls back to calling Ollama directly at
-`:11434` so the panel still works — set `ASSISTANT_ALLOW_OLLAMA_FALLBACK=0` to
-require LibreChat.
+## 3. Create the agent (one-time, in the LibreChat UI)
+1. Open http://localhost:3080, **register the first user** (becomes admin) — this
+   grants agent + MCP permissions.
+2. **Agents builder → new agent:**
+   - Endpoint = **Ollama**, Model = **`qwen2.5-coder:7b`**.
+   - **Instructions** = paste the full contents of `agent-guidelines.md`.
+   - **Tools** = enable the **clickhouse** MCP tools (`list_tables`, `run_query`, …).
+   - Save.
+3. Chat with the agent (e.g. *"What was the peak concurrency and at what minute?"*).
+   It should call `run_query` and answer from live data.
+
+## 4. Embed in the dashboard
+The dashboard's **✨ Copilot** tab already iframes `http://localhost:3080`
+(`config.LIBRECHAT_EMBED_URL`, override with `LIBRECHAT_URL`). If the iframe stays
+blank, use the tab's "Open in a new tab" link — some browsers block cross-origin
+framing / third-party cookies for `localhost:8501 → :3080`. To allow framing you
+can put LibreChat behind a small reverse proxy that sets
+`Content-Security-Policy: frame-ancestors 'self' http://localhost:8501` and drops
+`X-Frame-Options`.
 
 ---
+
+## Proxy / egress notes (restricted networks)
+- Only the corporate proxy (`http://proxy.bloomberg.com:81`) can reach the
+  internet; direct egress is blocked. The override sets `HTTPS_PROXY` on the
+  `ollama` and `mcp-clickhouse` services and **pins the proxy IP** via
+  `extra_hosts: ["proxy.bloomberg.com:69.191.241.9"]` (in-container DNS may not
+  resolve corporate hosts). If the proxy IP changes, re-resolve it and update the
+  override.
+- **Fallback if in-container egress fails:** run `mcp-clickhouse` on the **host**
+  instead (the proven path) and point `librechat.yaml`'s `mcpServers.clickhouse.url`
+  at `http://host.docker.internal:8000/mcp`.
 
 ## Troubleshooting
-
-- **`Could not reach LibreChat` in the panel** — is `docker compose up -d` up? Is
-  `LIBRECHAT_AGENT_ID` a real agent id and `LIBRECHAT_API_KEY` the current key?
-- **401 / permission errors** — the API key's user must have the remote-agents
-  permission. The first-registered user is admin (has it by default); confirm
-  `interface.remoteAgents.use: true` is in `librechat.yaml` and the stack was
-  restarted after adding it.
-- **Empty replies / model errors** — pull the model:
-  `docker compose exec ollama ollama pull llama3.2:3b`.
-- **Proxy failures** — the override blanks `*_PROXY`; if you still see proxy
-  errors, confirm `NO_PROXY` includes `localhost,127.0.0.1,ollama`.
+- **Agent can't see the clickhouse tools** — confirm `mcpServers` is in the mounted
+  `librechat.yaml` and the stack was restarted; check `docker compose logs api` for
+  MCP connection errors. The `mcpServers` schema differs across LibreChat versions
+  — older builds use `type: sse` with a `/sse` URL instead of `streamable-http /mcp`.
+- **MCP → ClickHouse errors** — verify `CLICKHOUSE_PORT=443`, `CLICKHOUSE_VERIFY=false`,
+  and the proxy env/`extra_hosts` on the `mcp-clickhouse` service.
+- **Empty replies / model errors** — `docker compose exec ollama ollama pull qwen2.5-coder:7b`.
+- **`mcp/clickhouse` image not found** — build it instead (see the commented
+  `pip install mcp-clickhouse` alternative in `docker-compose.override.yaml`).
 
 ## Current state / stretch
-
-- Local Ollama (`llama3.2:3b`) wired as the model endpoint; dashboard Copilot
-  routes through LibreChat's remote-agents API.
-- ClickHouse **MCP** integration (so LibreChat agents can query the concurrency
-  data directly) is not yet configured — still a stretch item.
+- Local Ollama (`qwen2.5-coder:7b`) + ClickHouse MCP wired; the dashboard Copilot
+  is the embedded LibreChat UI.
+- Read-only MCP (`CLICKHOUSE_ALLOW_WRITE_ACCESS=false`). Write access is a
+  deliberate non-goal for the demo.

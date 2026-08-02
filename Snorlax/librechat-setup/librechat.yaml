@@ -1,11 +1,18 @@
 version: 1.3.13
 cache: true
 
-# Enable the OpenAI-compatible "remote agents" API so the SonyLIV dashboard can
-# call LibreChat headlessly at POST /api/agents/v1/chat/completions with an agent
-# API key. The first registered user is an admin and gets these permissions;
-# create an agent (wired to the Ollama endpoint below) and an API key from the
-# UI, then point the dashboard at them. See ./README.md → "Remote agents".
+# The MCP server runs inside the compose network, so its origin
+# (http://mcp-clickhouse:8000) resolves to a PRIVATE Docker IP — LibreChat's
+# SSRF/domain guard blocks that by default ("Domain ... is not allowed").
+# Allowlisting the exact origin short-circuits the block for this server only.
+mcpSettings:
+  allowedDomains:
+    - "http://mcp-clickhouse:8000"
+
+# The SonyLIV dashboard embeds LibreChat (iframe, "✨ Copilot" tab). Agents are
+# created in the UI and wired to the Ollama endpoint below + the ClickHouse MCP
+# tools (see mcpServers). remoteAgents stays enabled so the headless
+# /api/agents/v1 API is also available if you want to call it directly.
 interface:
   remoteAgents:
     use: true
@@ -17,9 +24,13 @@ endpoints:
   custom:
     - name: "Ollama"
       apiKey: "ollama"
-      baseURL: "http://ollama:11434/v1/"
+      baseURL: "http://host.docker.internal:11434/v1/"
       models:
+        # qwen2.5-coder:7b is the default — far better at ClickHouse SQL + MCP
+        # tool-calling than llama3.2:3b. fetch:true also surfaces any other model
+        # pulled into the Ollama container.
         default:
+          - "qwen2.5-coder:7b"
           - "llama3.2:3b"
       fetch: true
       titleConvo: true
@@ -27,3 +38,16 @@ endpoints:
       summarize: false
       summaryModel: "current_model"
       modelDisplayLabel: "Ollama"
+
+# ClickHouse MCP server (docker-compose service `mcp-clickhouse`). Its tools
+# (list_databases / list_tables / run_query) become available to Agents in the
+# builder — attach them to the SonyLIV agent so it can query the live database.
+# NOTE: verify this block against your LibreChat version's MCP schema; older
+# builds use `type: sse` with a `/sse` URL instead of streamable-http `/mcp`.
+mcpServers:
+  clickhouse:
+    type: streamable-http
+    url: "http://mcp-clickhouse:8000/mcp"
+    headers:
+      Authorization: "Bearer ${MCP_AUTH_TOKEN}"
+    timeout: 60000

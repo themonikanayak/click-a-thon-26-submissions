@@ -6,9 +6,8 @@ Three panes:
   3. Insights    — derived user & content analytics from joined datasets
                    (PLACEHOLDER sample data, see insights.py).
 
-Plus an optional "Insights Copilot" side panel — a native chat (st.chat_*)
-grounded in the currently selected filters/KPIs, backed directly by a local
-Ollama model shared with LibreChat (see assistant.py).
+Plus an "✨ Copilot" tab that embeds LibreChat (see ../librechat-setup/) — an
+Ollama agent that queries ClickHouse directly via the ClickHouse MCP server.
 
 ClickHouse-inspired theme (config.py / ui.py). Run:
     pip install -r requirements.txt
@@ -23,13 +22,13 @@ from datetime import date, datetime, time
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
-import assistant
 import errors as errmod
 import insights as insmod
 import queries
 import ui
-from config import DB, REFRESH_MS
+from config import DB, LIBRECHAT_EMBED_URL, REFRESH_MS
 
 st.set_page_config(page_title="SonyLIV — Viewing Concurrency", layout="wide")
 
@@ -45,12 +44,12 @@ DANGER_FILL = "rgba(255,107,107,0.14)"
 # ===========================================================================
 # Pane 1 — Concurrency (real data)
 # ===========================================================================
-def render_concurrency(time_filter: dict) -> dict:
+def render_concurrency(time_filter: dict) -> None:
     try:
         opts = queries.get_filter_options()
     except Exception as e:  # noqa: BLE001
         st.error(f"⚠ Failed to load filters: {e}")
-        return {}
+        return
 
     f = {**queries.EMPTY_FILTERS, **time_filter}
 
@@ -80,7 +79,7 @@ def render_concurrency(time_filter: dict) -> dict:
         curve = queries.get_curve(f)
     except Exception as e:  # noqa: BLE001
         st.error(f"⚠ Query failed: {e}")
-        return {}
+        return
 
     avg = stats["avg_concurrency"]
     avg_str = f"{avg:,.1f}" if pd.notna(avg) else "—"
@@ -181,24 +180,6 @@ def render_concurrency(time_filter: dict) -> dict:
             hide_index=True,
             width="stretch",
         )
-
-    return {
-        "time_range": time_filter,
-        "filters": {
-            k: f[k]
-            for k in ("platform", "country", "video_type", "category", "content_id")
-        },
-        "metrics": {
-            "peak_concurrency": stats["peak_concurrency"],
-            "peak_minute": stats["peak_minute"],
-            "current_concurrency": stats["last_minute_concurrency"],
-            "average_concurrency": stats["avg_concurrency"],
-            "min_concurrency": stats["min_concurrency"],
-            "p95_concurrency": stats["p95_concurrency"],
-            "active_minutes": stats["active_minutes"],
-        },
-        "top_content": tc.head(10).to_dict("records") if not tc.empty else [],
-    }
 
 
 # ===========================================================================
@@ -379,54 +360,26 @@ def render_insights(time_filter: dict) -> None:
 
 
 # ===========================================================================
-# Insights Copilot — native chat panel, grounded in dashboard context
+# Pane 4 — Insights Copilot (embedded LibreChat agent + ClickHouse MCP)
 # ===========================================================================
-_SUGGESTIONS = ["Explain the peak", "Summarize this range", "Find anomalies"]
+_COPILOT_HEIGHT = 760
 
 
-def _submit(prompt: str, context: dict) -> None:
-    st.session_state.chat_messages.append({"role": "user", "content": prompt})
-    with st.spinner("Thinking..."):
-        reply = assistant.ask_assistant(context, st.session_state.chat_messages)
-    st.session_state.chat_messages.append({"role": "assistant", "content": reply})
-
-
-_HISTORY_HEIGHT = 420
-
-
-def render_native_chat(context: dict) -> None:
-    title_col, close_col = st.columns([5, 1])
-    title_col.markdown("### ✨ Insights Copilot")
-    if close_col.button("✕", help="Hide", width="stretch"):
-        st.session_state.chat_open = False
-        st.rerun()
-    st.caption("Ask questions about the currently selected dashboard data.")
-
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = [
-            {
-                "role": "assistant",
-                "content": "Hi! I can help explain concurrency, errors and viewing "
-                "patterns for the selected time range.",
-            }
-        ]
-
-    history = st.container(height=_HISTORY_HEIGHT)
-    with history:
-        for message in st.session_state.chat_messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-
-    cols = st.columns(len(_SUGGESTIONS))
-    for col, label in zip(cols, _SUGGESTIONS):
-        if col.button(label, width="stretch"):
-            _submit(label, context)
-            st.rerun()
-
-    prompt = st.chat_input("Ask about the current dashboard...")
-    if prompt:
-        _submit(prompt, context)
-        st.rerun()
+def render_copilot() -> None:
+    st.caption(
+        "Ask the **Insights Copilot** about the live concurrency data — a local "
+        "Ollama agent (via LibreChat) that queries ClickHouse directly through the "
+        "ClickHouse MCP server. See `../librechat-setup/` for setup."
+    )
+    st.markdown(
+        f'<a class="mono" href="{LIBRECHAT_EMBED_URL}" target="_blank" '
+        f'rel="noopener">↗ Open the Copilot in a new tab</a> '
+        "<span class='dash-sub'>(use this if the embed below stays blank — some "
+        "browsers block framing / third-party cookies)</span>",
+        unsafe_allow_html=True,
+    )
+    st.write("")
+    components.iframe(LIBRECHAT_EMBED_URL, height=_COPILOT_HEIGHT, scrolling=True)
 
 
 # ===========================================================================
@@ -443,9 +396,6 @@ def main() -> None:
         st.error(f"⚠ Could not connect to ClickHouse: {e}")
         st.stop()
 
-    if "chat_open" not in st.session_state:
-        st.session_state.chat_open = False
-
     # ---- Header --------------------------------------------------------------
     left, right = st.columns([3, 2])
     with left:
@@ -458,17 +408,13 @@ def main() -> None:
             unsafe_allow_html=True,
         )
     with right:
-        c1, c2, c3 = st.columns([1.2, 1, 1])
+        c1, c2 = st.columns([1.4, 1])
         auto = c1.toggle("Auto-refresh (30s)", value=True)
         refresh = c2.button("Refresh", width="stretch", type="primary")
-        ask_ai = c3.button("✨ Insights Copilot", width="stretch")
 
     if auto and st_autorefresh is not None:
         st_autorefresh(interval=REFRESH_MS, key="auto")
     if refresh:
-        st.rerun()
-    if ask_ai:
-        st.session_state.chat_open = not st.session_state.chat_open
         st.rerun()
 
     dot = "live" if auto else ""
@@ -493,27 +439,18 @@ def main() -> None:
     }
     st.write("")
 
-    # ---- Dashboard (+ optional Insights Copilot panel) ------------------------
-    if st.session_state.chat_open:
-        dashboard_col, chat_col = st.columns([3.2, 1.2])
-    else:
-        dashboard_col, chat_col = st.container(), None
-
-    context: dict = {}
-    with dashboard_col:
-        tab_conc, tab_err, tab_ins = st.tabs(
-            ["📈 Concurrency", "🚨 Errors", "🧭 Insights"]
-        )
-        with tab_conc:
-            context = render_concurrency(time_filter)
-        with tab_err:
-            render_errors(time_filter)
-        with tab_ins:
-            render_insights(time_filter)
-
-    if chat_col is not None:
-        with chat_col:
-            render_native_chat(context)
+    # ---- Dashboard tabs ------------------------------------------------------
+    tab_conc, tab_err, tab_ins, tab_ai = st.tabs(
+        ["📈 Concurrency", "🚨 Errors", "🧭 Insights", "✨ Copilot"]
+    )
+    with tab_conc:
+        render_concurrency(time_filter)
+    with tab_err:
+        render_errors(time_filter)
+    with tab_ins:
+        render_insights(time_filter)
+    with tab_ai:
+        render_copilot()
 
 
 if __name__ == "__main__":
